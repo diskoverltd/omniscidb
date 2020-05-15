@@ -864,18 +864,20 @@ size_t BufferMgr::getMaxSlabSize() {
   return max_slab_size_;
 }
 
-void BufferMgr::getChunkMetadataVec(
-    std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunk_metadata_vec) {
+void BufferMgr::getChunkMetadataVec(ChunkMetadataVector& chunk_metadata_vec) {
   LOG(FATAL) << "getChunkMetadataVec not supported for BufferMgr.";
 }
 
-void BufferMgr::getChunkMetadataVecForKeyPrefix(
-    std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunk_metadata_vec,
-    const ChunkKey& key_prefix) {
+void BufferMgr::getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunk_metadata_vec,
+                                                const ChunkKey& key_prefix) {
   LOG(FATAL) << "getChunkMetadataVecForPrefix not supported for BufferMgr.";
 }
 
 const std::vector<BufferList>& BufferMgr::getSlabSegments() {
   return slab_segments_;
+}
+
+void BufferMgr::removeTableRelatedDS(const int db_id, const int table_id) {
+  UNREACHABLE();
 }
 }  // namespace Buffer_Namespace

@@ -17,11 +17,14 @@
 #include "CodeGenerator.h"
 #include "Execute.h"
 #include "ExtensionFunctionsWhitelist.h"
+#include "GpuSharedMemoryUtils.h"
 #include "LLVMFunctionAttributesUtil.h"
 #include "OutputBufferInitialization.h"
 #include "QueryTemplateGenerator.h"
 
+#include "Shared/MathUtils.h"
 #include "Shared/mapdpath.h"
+#include "StreamingTopN.h"
 
 #if LLVM_VERSION_MAJOR < 4
 static_assert(false, "LLVM Version >= 4 is required.");
@@ -114,7 +117,7 @@ void optimize_ir(llvm::Function* query_func,
   pass_manager.add(llvm::createGlobalOptimizerPass());
 
   pass_manager.add(llvm::createLICMPass());
-  if (co.opt_level_ == ExecutorOptLevel::LoopStrengthReduction) {
+  if (co.opt_level == ExecutorOptLevel::LoopStrengthReduction) {
     pass_manager.add(llvm::createLoopStrengthReducePass());
   }
   pass_manager.run(*module);
@@ -134,7 +137,7 @@ ExecutionEngineWrapper::ExecutionEngineWrapper(llvm::ExecutionEngine* execution_
                                                const CompilationOptions& co)
     : execution_engine_(execution_engine) {
   if (execution_engine_) {
-    if (co.register_intel_jit_listener_) {
+    if (co.register_intel_jit_listener) {
       intel_jit_listener_.reset(llvm::JITEventListener::createIntelJITEventListener());
       CHECK(intel_jit_listener_);
       execution_engine_->RegisterJITEventListener(intel_jit_listener_.get());
@@ -235,7 +238,7 @@ ExecutionEngineWrapper CodeGenerator::generateNativeCPUCode(
   llvm::TargetOptions to;
   to.EnableFastISel = true;
   eb.setTargetOptions(to);
-  if (co.opt_level_ == ExecutorOptLevel::ReductionJIT) {
+  if (co.opt_level == ExecutorOptLevel::ReductionJIT) {
     eb.setOptLevel(llvm::CodeGenOpt::None);
   }
 
@@ -376,21 +379,17 @@ declare void @llvm.lifetime.start(i64, i8* nocapture) nounwind
 declare void @llvm.lifetime.end(i64, i8* nocapture) nounwind
 declare void @llvm.lifetime.start.p0i8(i64, i8* nocapture) nounwind
 declare void @llvm.lifetime.end.p0i8(i64, i8* nocapture) nounwind
+declare i64 @get_thread_index();
+declare i64 @get_block_index();
 declare i32 @pos_start_impl(i32*);
 declare i32 @group_buff_idx_impl();
 declare i32 @pos_step_impl();
 declare i8 @thread_warp_idx(i8);
 declare i64* @init_shared_mem(i64*, i32);
 declare i64* @init_shared_mem_nop(i64*, i32);
-declare i64* @init_shared_mem_dynamic(i64*, i32);
-declare i64* @alloc_shared_mem_dynamic();
-declare void @set_shared_mem_to_identity(i64*, i32, i64);
-declare void @write_back(i64*, i64*, i32);
-declare void @write_back_smem_nop(i64*, i64*, i32);
+declare i64* @declare_dynamic_shared_memory();
 declare void @write_back_nop(i64*, i64*, i32);
-declare void @agg_from_smem_to_gmem_nop(i64*, i64*, i32);
-declare void @agg_from_smem_to_gmem_binId_count(i64*, i64*, i32);
-declare void @agg_from_smem_to_gmem_count_binId(i64*, i64*, i32);
+declare void @write_back_non_grouped_agg(i64*, i64*, i32);
 declare void @init_group_by_buffer_gpu(i64*, i64*, i32, i32, i32, i1, i8);
 declare i64* @get_group_value(i64*, i32, i64*, i32, i32, i32, i64*);
 declare i64* @get_group_value_with_watchdog(i64*, i32, i64*, i32, i32, i32, i64*);
@@ -405,6 +404,8 @@ declare i64 @get_composite_key_index_32(i32*, i64, i32*, i64);
 declare i64 @get_composite_key_index_64(i64*, i64, i64*, i64);
 declare i64 @get_bucket_key_for_range_compressed(i8*, i64, double);
 declare i64 @get_bucket_key_for_range_double(i8*, i64, double);
+declare i32 @get_num_buckets_for_bounds(i8*, i32, double, double);
+declare i64 @get_candidate_rows(i32*, i32, i8*, i32, double, double, i32, i64, i64*, i64, i64, i64);
 declare i64 @agg_count_shared(i64*, i64);
 declare i64 @agg_count_skip_val_shared(i64*, i64, i64);
 declare i32 @agg_count_int32_shared(i32*, i32);
@@ -539,9 +540,11 @@ declare void @agg_count_distinct_bitmap_skip_val_gpu(i64*, i64, i64, i64, i64, i
 declare void @agg_approximate_count_distinct_gpu(i64*, i64, i32, i64, i64);
 declare i32 @record_error_code(i32, i32*);
 declare i1 @dynamic_watchdog();
+declare i1 @check_interrupt();
 declare void @force_sync();
 declare void @sync_warp();
 declare void @sync_warp_protected(i64, i64);
+declare void @sync_threadblock();
 declare i64* @get_bin_from_k_heap_int32_t(i64*, i32, i32, i32, i1, i1, i1, i32, i32);
 declare i64* @get_bin_from_k_heap_int64_t(i64*, i32, i32, i32, i1, i1, i1, i64, i64);
 declare i64* @get_bin_from_k_heap_float(i64*, i32, i32, i32, i1, i1, i1, float, float);
@@ -686,6 +689,11 @@ CodeGenerator::GPUCode CodeGenerator::generateNativeGPUCode(
     roots.insert(gpu_target.cgen_state->row_func_);
   }
 
+  // prevent helper functions from being removed
+  for (auto f : gpu_target.cgen_state->helper_functions_) {
+    roots.insert(f);
+  }
+
   // Prevent the udf function(s) from being removed the way the runtime functions are
 
   std::unordered_set<std::string> udf_declarations;
@@ -745,8 +753,8 @@ CodeGenerator::GPUCode CodeGenerator::generateNativeGPUCode(
   std::vector<std::pair<void*, void*>> native_functions;
   std::vector<std::tuple<void*, GpuCompilationContext*>> cached_functions;
 
-  const auto ptx =
-      generatePTX(cuda_llir, gpu_target.nvptx_target_machine, gpu_target.cgen_state);
+  const auto ptx = generatePTX(
+      cuda_llir, gpu_target.nvptx_target_machine, gpu_target.cgen_state->context_);
 
   LOG(PTX) << "PTX for the GPU:\n" << ptx << "\nEnd of PTX";
 
@@ -795,6 +803,7 @@ std::vector<std::pair<void*, void*>> Executor::optimizeAndCodegenGPU(
   CHECK(cuda_mgr);
   CodeCacheKey key{serialize_llvm_object(query_func),
                    serialize_llvm_object(cgen_state_->row_func_)};
+
   for (const auto helper : cgen_state_->helper_functions_) {
     key.push_back(serialize_llvm_object(helper));
   }
@@ -840,12 +849,12 @@ std::vector<std::pair<void*, void*>> Executor::optimizeAndCodegenGPU(
 
 std::string CodeGenerator::generatePTX(const std::string& cuda_llir,
                                        llvm::TargetMachine* nvptx_target_machine,
-                                       CgenState* cgen_state) {
+                                       llvm::LLVMContext& context) {
   auto mem_buff = llvm::MemoryBuffer::getMemBuffer(cuda_llir, "", false);
 
   llvm::SMDiagnostic err;
 
-  auto module = llvm::parseIR(mem_buff->getMemBufferRef(), err, cgen_state->context_);
+  auto module = llvm::parseIR(mem_buff->getMemBufferRef(), err, context);
   if (!module) {
     LOG(FATAL) << err.getMessage().str();
   }
@@ -857,7 +866,10 @@ std::string CodeGenerator::generatePTX(const std::string& cuda_llir,
     llvm::legacy::PassManager ptxgen_pm;
     module->setDataLayout(nvptx_target_machine->createDataLayout());
 
-#if LLVM_VERSION_MAJOR >= 7
+#if LLVM_VERSION_MAJOR >= 10
+    nvptx_target_machine->addPassesToEmitFile(
+        ptxgen_pm, formatted_os, nullptr, llvm::CGFT_AssemblyFile);
+#elif LLVM_VERSION_MAJOR >= 7
     nvptx_target_machine->addPassesToEmitFile(
         ptxgen_pm, formatted_os, nullptr, llvm::TargetMachine::CGFT_AssemblyFile);
 #else
@@ -870,7 +882,8 @@ std::string CodeGenerator::generatePTX(const std::string& cuda_llir,
   return code_str.str();
 }
 
-std::unique_ptr<llvm::TargetMachine> CodeGenerator::initializeNVPTXBackend() {
+std::unique_ptr<llvm::TargetMachine> CodeGenerator::initializeNVPTXBackend(
+    const CudaMgr_Namespace::NvidiaDeviceArch arch) {
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllAsmPrinters();
@@ -879,20 +892,28 @@ std::unique_ptr<llvm::TargetMachine> CodeGenerator::initializeNVPTXBackend() {
   if (!target) {
     LOG(FATAL) << err;
   }
-  return std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(
-      "nvptx64-nvidia-cuda", "sm_30", "", llvm::TargetOptions(), llvm::Reloc::Static));
+  return std::unique_ptr<llvm::TargetMachine>(
+      target->createTargetMachine("nvptx64-nvidia-cuda",
+                                  CudaMgr_Namespace::CudaMgr::deviceArchToSM(arch),
+                                  "",
+                                  llvm::TargetOptions(),
+                                  llvm::Reloc::Static));
 }
 
 std::string Executor::generatePTX(const std::string& cuda_llir) const {
   return CodeGenerator::generatePTX(
-      cuda_llir, nvptx_target_machine_.get(), cgen_state_.get());
+      cuda_llir, nvptx_target_machine_.get(), cgen_state_->context_);
 }
 
 void Executor::initializeNVPTXBackend() const {
   if (nvptx_target_machine_) {
     return;
   }
-  nvptx_target_machine_ = CodeGenerator::initializeNVPTXBackend();
+  const auto cuda_mgr = catalog_->getDataMgr().getCudaMgr();
+  LOG_IF(FATAL, cuda_mgr == nullptr) << "No CudaMgr instantiated, unable to check device "
+                                        "architecture or generate code for nvidia GPUs.";
+  const auto arch = cuda_mgr->getDeviceArch();
+  nvptx_target_machine_ = CodeGenerator::initializeNVPTXBackend(arch);
 }
 
 // A small number of runtime functions don't get through CgenState::emitCall. List them
@@ -1333,12 +1354,20 @@ llvm::Value* find_variable_in_basic_block(llvm::Function* func,
 
 void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
                                            bool run_with_dynamic_watchdog,
+                                           bool run_with_allowing_runtime_interrupt,
                                            ExecutorDeviceType device_type) {
   // check whether the row processing was successful; currently, it can
   // fail by running out of group by buffer slots
 
+  if (run_with_dynamic_watchdog && run_with_allowing_runtime_interrupt) {
+    // when both dynamic watchdog and runtime interrupt turns on
+    // we use dynamic watchdog
+    run_with_allowing_runtime_interrupt = false;
+  }
+
   llvm::Value* row_count = nullptr;
-  if (run_with_dynamic_watchdog && device_type == ExecutorDeviceType::GPU) {
+  if ((run_with_dynamic_watchdog || run_with_allowing_runtime_interrupt) &&
+      device_type == ExecutorDeviceType::GPU) {
     row_count =
         find_variable_in_basic_block<llvm::LoadInst>(query_func, ".entry", "row_count");
   }
@@ -1348,7 +1377,8 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
        ++bb_it) {
     llvm::Value* pos = nullptr;
     for (auto inst_it = bb_it->begin(); inst_it != bb_it->end(); ++inst_it) {
-      if (run_with_dynamic_watchdog && llvm::isa<llvm::PHINode>(*inst_it)) {
+      if ((run_with_dynamic_watchdog || run_with_allowing_runtime_interrupt) &&
+          llvm::isa<llvm::PHINode>(*inst_it)) {
         if (inst_it->getName() == "pos") {
           pos = &*inst_it;
         }
@@ -1369,7 +1399,7 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           CHECK(pos);
           llvm::Value* call_watchdog_lv = nullptr;
           if (device_type == ExecutorDeviceType::GPU) {
-            // In order to make sure all threads wihtin a block see the same barrier,
+            // In order to make sure all threads within a block see the same barrier,
             // only those blocks whose none of their threads have experienced the critical
             // edge will go through the dynamic watchdog computation
             CHECK(row_count);
@@ -1418,6 +1448,62 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           unified_err_lv->addIncoming(timeout_err_lv, watchdog_check_bb);
           unified_err_lv->addIncoming(err_lv, &*bb_it);
           err_lv = unified_err_lv;
+        } else if (run_with_allowing_runtime_interrupt) {
+          CHECK(pos);
+          llvm::Value* call_check_interrupt_lv = nullptr;
+          if (device_type == ExecutorDeviceType::GPU) {
+            // approximate how many times the %pos variable
+            // is increased --> the number of iteration
+            int32_t num_shift_by_gridDim = getExpOfTwo(gridSize());
+            int32_t num_shift_by_blockDim = getExpOfTwo(blockSize());
+            if (!isPowOfTwo(gridSize())) {
+              num_shift_by_gridDim++;
+            }
+            if (!isPowOfTwo(blockSize())) {
+              num_shift_by_blockDim++;
+            }
+            int total_num_shift = num_shift_by_gridDim + num_shift_by_blockDim;
+            // check the interrupt flag for every 64th iteration
+            llvm::Value* pos_shifted_per_iteration =
+                ir_builder.CreateLShr(pos, cgen_state_->llInt(total_num_shift));
+            auto interrupt_predicate =
+                ir_builder.CreateAnd(pos_shifted_per_iteration, uint64_t(0x3f));
+            call_check_interrupt_lv =
+                ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                      interrupt_predicate,
+                                      cgen_state_->llInt(int64_t(0LL)));
+          } else {
+            // CPU path: run interrupt checker for every 64th row
+            auto interrupt_predicate = ir_builder.CreateAnd(pos, uint64_t(0x3f));
+            call_check_interrupt_lv =
+                ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                      interrupt_predicate,
+                                      cgen_state_->llInt(int64_t(0LL)));
+          }
+          CHECK(call_check_interrupt_lv);
+          auto error_check_bb = bb_it->splitBasicBlock(
+              llvm::BasicBlock::iterator(br_instr), ".error_check");
+          auto& check_interrupt_br_instr = bb_it->back();
+
+          auto interrupt_check_bb = llvm::BasicBlock::Create(
+              cgen_state_->context_, ".interrupt_check", query_func, error_check_bb);
+          llvm::IRBuilder<> interrupt_checker_ir_builder(interrupt_check_bb);
+          auto detected_interrupt = interrupt_checker_ir_builder.CreateCall(
+              cgen_state_->module_->getFunction("check_interrupt"), {});
+          auto interrupt_err_lv = interrupt_checker_ir_builder.CreateSelect(
+              detected_interrupt, cgen_state_->llInt(Executor::ERR_INTERRUPTED), err_lv);
+          interrupt_checker_ir_builder.CreateBr(error_check_bb);
+
+          llvm::ReplaceInstWithInst(
+              &check_interrupt_br_instr,
+              llvm::BranchInst::Create(
+                  interrupt_check_bb, error_check_bb, call_check_interrupt_lv));
+          ir_builder.SetInsertPoint(&br_instr);
+          auto unified_err_lv = ir_builder.CreatePHI(err_lv->getType(), 2);
+
+          unified_err_lv->addIncoming(interrupt_err_lv, interrupt_check_bb);
+          unified_err_lv->addIncoming(err_lv, &*bb_it);
+          err_lv = unified_err_lv;
         }
         const auto error_code_arg = get_arg_by_name(query_func, "error_code");
         err_lv =
@@ -1427,9 +1513,16 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           // let kernel execution finish as expected, regardless of the observed error,
           // unless it is from the dynamic watchdog where all threads within that block
           // return together.
-          err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
-                                         err_lv,
-                                         cgen_state_->llInt(Executor::ERR_OUT_OF_TIME));
+          if (run_with_allowing_runtime_interrupt) {
+            err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                           err_lv,
+                                           cgen_state_->llInt(Executor::ERR_INTERRUPTED));
+          } else {
+            err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                           err_lv,
+                                           cgen_state_->llInt(Executor::ERR_OUT_OF_TIME));
+          }
+
         } else {
           err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_NE,
                                          err_lv,
@@ -1555,6 +1648,124 @@ std::vector<llvm::Value*> Executor::inlineHoistedLiterals() {
   return hoisted_literals;
 }
 
+namespace {
+
+size_t get_shared_memory_size(const bool shared_mem_used,
+                              const QueryMemoryDescriptor* query_mem_desc_ptr) {
+  return shared_mem_used
+             ? (query_mem_desc_ptr->getRowSize() * query_mem_desc_ptr->getEntryCount())
+             : 0;
+}
+
+bool is_gpu_shared_mem_supported(const QueryMemoryDescriptor* query_mem_desc_ptr,
+                                 const RelAlgExecutionUnit& ra_exe_unit,
+                                 const CudaMgr_Namespace::CudaMgr* cuda_mgr,
+                                 const ExecutorDeviceType device_type,
+                                 const unsigned gpu_blocksize) {
+  if (device_type == ExecutorDeviceType::CPU) {
+    return false;
+  }
+  if (query_mem_desc_ptr->didOutputColumnar()) {
+    return false;
+  }
+  CHECK(query_mem_desc_ptr);
+  CHECK(cuda_mgr);
+  /*
+   *  We only use shared memory strategy if GPU hardware provides native shared
+   *memory atomics support. From CUDA Toolkit documentation:
+   *https://docs.nvidia.com/cuda/pascal-tuning-guide/index.html#atomic-ops "Like
+   *Maxwell, Pascal [and Volta] provides native shared memory atomic operations
+   *for 32-bit integer arithmetic, along with native 32 or 64-bit compare-and-swap
+   *(CAS)."
+   *
+   **/
+  if (!cuda_mgr->isArchMaxwellOrLaterForAll()) {
+    return false;
+  }
+
+  if (query_mem_desc_ptr->getQueryDescriptionType() ==
+          QueryDescriptionType::NonGroupedAggregate &&
+      g_enable_smem_non_grouped_agg &&
+      query_mem_desc_ptr->countDistinctDescriptorsLogicallyEmpty()) {
+    // TODO: relax this, if necessary
+    if (gpu_blocksize < query_mem_desc_ptr->getEntryCount()) {
+      return false;
+    }
+    // skip shared memory usage when dealing with 1) variable length targets, 2)
+    // not a COUNT aggregate
+    const auto target_infos =
+        target_exprs_to_infos(ra_exe_unit.target_exprs, *query_mem_desc_ptr);
+    std::unordered_set<SQLAgg> supported_aggs{kCOUNT};
+    if (std::find_if(target_infos.begin(),
+                     target_infos.end(),
+                     [&supported_aggs](const TargetInfo& ti) {
+                       if (ti.sql_type.is_varlen() ||
+                           !supported_aggs.count(ti.agg_kind)) {
+                         return true;
+                       } else {
+                         return false;
+                       }
+                     }) == target_infos.end()) {
+      return true;
+    }
+  }
+  if (query_mem_desc_ptr->getQueryDescriptionType() ==
+          QueryDescriptionType::GroupByPerfectHash &&
+      g_enable_smem_group_by) {
+    /**
+     * To simplify the implementation for practical purposes, we
+     * initially provide shared memory support for cases where there are at most as many
+     * entries in the output buffer as there are threads within each GPU device. In
+     * order to relax this assumption later, we need to add a for loop in generated
+     * codes such that each thread loops over multiple entries.
+     * TODO: relax this if necessary
+     */
+    if (gpu_blocksize < query_mem_desc_ptr->getEntryCount()) {
+      return false;
+    }
+
+    // Fundamentally, we should use shared memory whenever the output buffer
+    // is small enough so that we can fit it in the shared memory and yet expect
+    // good occupancy.
+    // For now, we allow keyless, row-wise layout, and only for perfect hash
+    // group by operations.
+    if (query_mem_desc_ptr->getGroupbyColCount() == 1 &&
+        query_mem_desc_ptr->hasKeylessHash() &&
+        query_mem_desc_ptr->countDistinctDescriptorsLogicallyEmpty() &&
+        !query_mem_desc_ptr->useStreamingTopN()) {
+      const size_t shared_memory_threshold_bytes =
+          std::min(g_gpu_smem_threshold, cuda_mgr->getMaxSharedMemoryForAll());
+      const auto output_buffer_size =
+          query_mem_desc_ptr->getRowSize() * query_mem_desc_ptr->getEntryCount();
+      if (output_buffer_size > shared_memory_threshold_bytes) {
+        return false;
+      }
+
+      // skip shared memory usage when dealing with 1) variable length targets, 2)
+      // non-basic aggregates (COUNT, SUM, MIN, MAX, AVG)
+      // TODO: relax this if necessary
+      const auto target_infos =
+          target_exprs_to_infos(ra_exe_unit.target_exprs, *query_mem_desc_ptr);
+      std::unordered_set<SQLAgg> supported_aggs{kCOUNT, kMIN, kMAX, kSUM, kAVG};
+      if (std::find_if(target_infos.begin(),
+                       target_infos.end(),
+                       [&supported_aggs](const TargetInfo& ti) {
+                         if (ti.sql_type.is_varlen() ||
+                             !supported_aggs.count(ti.agg_kind)) {
+                           return true;
+                         } else {
+                           return false;
+                         }
+                       }) == target_infos.end()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 std::tuple<Executor::CompilationResult, std::unique_ptr<QueryMemoryDescriptor>>
 Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
                           const RelAlgExecutionUnit& ra_exe_unit,
@@ -1572,7 +1783,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   nukeOldState(allow_lazy_fetch, query_infos, &ra_exe_unit);
 
   GroupByAndAggregate group_by_and_aggregate(
-      this, co.device_type_, ra_exe_unit, query_infos, row_set_mem_owner);
+      this, co.device_type, ra_exe_unit, query_infos, row_set_mem_owner);
   auto query_mem_desc =
       group_by_and_aggregate.initQueryMemoryDescriptor(eo.allow_multifrag,
                                                        max_groups_buffer_entry_guess,
@@ -1588,8 +1799,26 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   }
 
   const bool output_columnar = query_mem_desc->didOutputColumnar();
+  const bool gpu_shared_mem_optimization =
+      is_gpu_shared_mem_supported(query_mem_desc.get(),
+                                  ra_exe_unit,
+                                  cuda_mgr,
+                                  co.device_type,
+                                  cuda_mgr ? this->blockSize() : 1);
 
-  if (co.device_type_ == ExecutorDeviceType::GPU) {
+  if (gpu_shared_mem_optimization) {
+    // disable interleaved bins optimization on the GPU
+    query_mem_desc->setHasInterleavedBinsOnGpu(false);
+    LOG(DEBUG1) << "GPU shared memory is used for the " +
+                       query_mem_desc->queryDescTypeToString() + " query(" +
+                       std::to_string(get_shared_memory_size(gpu_shared_mem_optimization,
+                                                             query_mem_desc.get())) +
+                       " out of " + std::to_string(g_gpu_smem_threshold) + " bytes).";
+  }
+  const GpuSharedMemoryContext gpu_smem_context(
+      get_shared_memory_size(gpu_shared_mem_optimization, query_mem_desc.get()));
+
+  if (co.device_type == ExecutorDeviceType::GPU) {
     const size_t num_count_distinct_descs =
         query_mem_desc->getCountDistinctDescriptorsSize();
     for (size_t i = 0; i < num_count_distinct_descs; i++) {
@@ -1597,7 +1826,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
           query_mem_desc->getCountDistinctDescriptor(i);
       if (count_distinct_descriptor.impl_type_ == CountDistinctImplType::StdSet ||
           (count_distinct_descriptor.impl_type_ != CountDistinctImplType::Invalid &&
-           !co.hoist_literals_)) {
+           !co.hoist_literals)) {
         throw QueryMustRunOnCpu();
       }
     }
@@ -1623,7 +1852,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
                 CodeGenerator::alwaysCloneRuntimeFunction(func));
       });
 
-  if (co.device_type_ == ExecutorDeviceType::CPU) {
+  if (co.device_type == ExecutorDeviceType::CPU) {
     if (is_udf_module_present(true)) {
       CodeGenerator::link_udf_module(udf_cpu_module, *rt_module_copy, cgen_state_.get());
     }
@@ -1659,14 +1888,16 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 
   const bool is_group_by{query_mem_desc->isGroupBy()};
   auto query_func = is_group_by ? query_group_by_template(cgen_state_->module_,
-                                                          co.hoist_literals_,
+                                                          co.hoist_literals,
                                                           *query_mem_desc,
-                                                          co.device_type_,
-                                                          ra_exe_unit.scan_limit)
+                                                          co.device_type,
+                                                          ra_exe_unit.scan_limit,
+                                                          gpu_smem_context)
                                 : query_template(cgen_state_->module_,
                                                  agg_slot_count,
-                                                 co.hoist_literals_,
-                                                 !!ra_exe_unit.estimator);
+                                                 co.hoist_literals,
+                                                 !!ra_exe_unit.estimator,
+                                                 gpu_smem_context);
   bind_pos_placeholders("pos_start", true, query_func, cgen_state_->module_);
   bind_pos_placeholders("group_buff_idx", false, query_func, cgen_state_->module_);
   bind_pos_placeholders("pos_step", false, query_func, cgen_state_->module_);
@@ -1679,7 +1910,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   std::tie(cgen_state_->row_func_, col_heads) =
       create_row_function(ra_exe_unit.input_col_descs.size(),
                           is_group_by ? 0 : agg_slot_count,
-                          co.hoist_literals_,
+                          co.hoist_literals,
                           query_func,
                           cgen_state_->module_,
                           cgen_state_->context_);
@@ -1708,22 +1939,26 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
                      co,
                      eo);
   } else {
-    const bool can_return_error =
-        compileBody(ra_exe_unit, group_by_and_aggregate, *query_mem_desc, co);
-    if (can_return_error || cgen_state_->needs_error_check_ || eo.with_dynamic_watchdog) {
-      createErrorCheckControlFlow(query_func, eo.with_dynamic_watchdog, co.device_type_);
+    const bool can_return_error = compileBody(
+        ra_exe_unit, group_by_and_aggregate, *query_mem_desc, co, gpu_smem_context);
+    if (can_return_error || cgen_state_->needs_error_check_ || eo.with_dynamic_watchdog ||
+        eo.allow_runtime_query_interrupt) {
+      createErrorCheckControlFlow(query_func,
+                                  eo.with_dynamic_watchdog,
+                                  eo.allow_runtime_query_interrupt,
+                                  co.device_type);
     }
   }
   std::vector<llvm::Value*> hoisted_literals;
 
-  if (co.hoist_literals_) {
+  if (co.hoist_literals) {
     VLOG(1) << "number of hoisted literals: "
             << cgen_state_->query_func_literal_loads_.size()
             << " / literal buffer usage: " << cgen_state_->getLiteralBufferUsage(0)
             << " bytes";
   }
 
-  if (co.hoist_literals_ && !cgen_state_->query_func_literal_loads_.empty()) {
+  if (co.hoist_literals && !cgen_state_->query_func_literal_loads_.empty()) {
     // we have some hoisted literals...
     hoisted_literals = inlineHoistedLiterals();
   }
@@ -1750,15 +1985,42 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
       break;
     }
   }
+
   plan_state_->init_agg_vals_ =
       init_agg_val_vec(ra_exe_unit.target_exprs, ra_exe_unit.quals, *query_mem_desc);
 
+  /*
+   * If we have decided to use GPU shared memory (decision is not made here), then
+   * we generate proper code for extra components that it needs (buffer initialization and
+   * gpu reduction from shared memory to global memory). We then replace these functions
+   * into the already compiled query_func (replacing two placeholders, write_back_nop and
+   * init_smem_nop). The rest of the code should be as before (row_func, etc.).
+   */
+  if (gpu_smem_context.isSharedMemoryUsed()) {
+    if (query_mem_desc->getQueryDescriptionType() ==
+        QueryDescriptionType::GroupByPerfectHash) {
+      GpuSharedMemCodeBuilder gpu_smem_code(
+          cgen_state_->module_,
+          cgen_state_->context_,
+          *query_mem_desc,
+          target_exprs_to_infos(ra_exe_unit.target_exprs, *query_mem_desc),
+          plan_state_->init_agg_vals_);
+      gpu_smem_code.codegen();
+      gpu_smem_code.injectFunctionsInto(query_func);
+
+      // helper functions are used for caching purposes later
+      cgen_state_->helper_functions_.push_back(gpu_smem_code.getReductionFunction());
+      cgen_state_->helper_functions_.push_back(gpu_smem_code.getInitFunction());
+      LOG(IR) << gpu_smem_code.toString();
+    }
+  }
+
   auto multifrag_query_func = cgen_state_->module_->getFunction(
-      "multifrag_query" + std::string(co.hoist_literals_ ? "_hoisted_literals" : ""));
+      "multifrag_query" + std::string(co.hoist_literals ? "_hoisted_literals" : ""));
   CHECK(multifrag_query_func);
 
   bind_query(query_func,
-             "query_stub" + std::string(co.hoist_literals_ ? "_hoisted_literals" : ""),
+             "query_stub" + std::string(co.hoist_literals ? "_hoisted_literals" : ""),
              multifrag_query_func,
              cgen_state_->module_);
 
@@ -1769,7 +2031,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 
   std::string llvm_ir;
   if (eo.just_explain) {
-    if (co.explain_type_ == ExecutorExplainType::Optimized) {
+    if (co.explain_type == ExecutorExplainType::Optimized) {
 #ifdef WITH_JIT_DEBUG
       throw std::runtime_error(
           "Explain optimized not available when JIT runtime debug symbols are enabled");
@@ -1788,7 +2050,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 
   return std::make_tuple(
       Executor::CompilationResult{
-          co.device_type_ == ExecutorDeviceType::CPU
+          co.device_type == ExecutorDeviceType::CPU
               ? optimizeAndCodegenCPU(query_func, multifrag_query_func, live_funcs, co)
               : optimizeAndCodegenGPU(query_func,
                                       multifrag_query_func,
@@ -1798,13 +2060,17 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
                                       co),
           cgen_state_->getLiterals(),
           output_columnar,
-          llvm_ir},
+          llvm_ir,
+          std::move(gpu_smem_context)},
       std::move(query_mem_desc));
 }
 
 llvm::BasicBlock* Executor::codegenSkipDeletedOuterTableRow(
     const RelAlgExecutionUnit& ra_exe_unit,
     const CompilationOptions& co) {
+  if (!co.add_delete_column) {
+    return nullptr;
+  }
   CHECK(!ra_exe_unit.input_descs.empty());
   const auto& outer_input_desc = ra_exe_unit.input_descs[0];
   if (outer_input_desc.getSourceType() != InputSourceType::TABLE) {
@@ -1839,7 +2105,8 @@ llvm::BasicBlock* Executor::codegenSkipDeletedOuterTableRow(
 bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
                            GroupByAndAggregate& group_by_and_aggregate,
                            const QueryMemoryDescriptor& query_mem_desc,
-                           const CompilationOptions& co) {
+                           const CompilationOptions& co,
+                           const GpuSharedMemoryContext& gpu_smem_context) {
   // generate the code for the filter
   std::vector<Analyzer::Expr*> primary_quals;
   std::vector<Analyzer::Expr*> deferred_quals;
@@ -1878,7 +2145,8 @@ bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
   }
 
   CHECK(filter_lv->getType()->isIntegerTy(1));
-  return group_by_and_aggregate.codegen(filter_lv, sc_false, query_mem_desc, co);
+  return group_by_and_aggregate.codegen(
+      filter_lv, sc_false, query_mem_desc, co, gpu_smem_context);
 }
 
 std::unique_ptr<llvm::Module> runtime_module_shallow_copy(CgenState* cgen_state) {

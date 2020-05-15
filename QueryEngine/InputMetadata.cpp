@@ -42,6 +42,8 @@ Fragmenter_Namespace::TableInfo build_table_info(
     CHECK(shard_table->fragmenter);
     const auto& shard_metainfo = shard_table->fragmenter->getFragmentsForQuery();
     total_number_of_tuples += shard_metainfo.getPhysicalNumTuples();
+    table_info_all_shards.fragments.reserve(table_info_all_shards.fragments.size() +
+                                            shard_metainfo.fragments.size());
     table_info_all_shards.fragments.insert(table_info_all_shards.fragments.end(),
                                            shard_metainfo.fragments.begin(),
                                            shard_metainfo.fragments.end());
@@ -81,7 +83,56 @@ bool uses_int_meta(const SQLTypeInfo& col_ti) {
          (col_ti.is_string() && col_ti.get_compression() == kENCODING_DICT);
 }
 
-std::map<int, ChunkMetadata> synthesize_metadata(const ResultSet* rows) {
+Fragmenter_Namespace::TableInfo synthesize_table_info(const ResultSetPtr& rows) {
+  std::vector<Fragmenter_Namespace::FragmentInfo> result;
+  if (rows) {
+    result.resize(1);
+    auto& fragment = result.front();
+    fragment.fragmentId = 0;
+    fragment.deviceIds.resize(3);
+    fragment.resultSet = rows.get();
+    fragment.resultSetMutex.reset(new std::mutex());
+  }
+  Fragmenter_Namespace::TableInfo table_info;
+  table_info.fragments = result;
+  return table_info;
+}
+
+void collect_table_infos(std::vector<InputTableInfo>& table_infos,
+                         const std::vector<InputDescriptor>& input_descs,
+                         Executor* executor) {
+  const auto temporary_tables = executor->getTemporaryTables();
+  const auto cat = executor->getCatalog();
+  CHECK(cat);
+  std::unordered_map<int, size_t> info_cache;
+  for (const auto& input_desc : input_descs) {
+    const auto table_id = input_desc.getTableId();
+    const auto cached_index_it = info_cache.find(table_id);
+    if (cached_index_it != info_cache.end()) {
+      CHECK_LT(cached_index_it->second, table_infos.size());
+      table_infos.push_back(
+          {table_id, copy_table_info(table_infos[cached_index_it->second].info)});
+      continue;
+    }
+    if (input_desc.getSourceType() == InputSourceType::RESULT) {
+      CHECK_LT(table_id, 0);
+      CHECK(temporary_tables);
+      const auto it = temporary_tables->find(table_id);
+      LOG_IF(FATAL, it == temporary_tables->end())
+          << "Failed to find previous query result for node " << -table_id;
+      table_infos.push_back({table_id, synthesize_table_info(it->second)});
+    } else {
+      CHECK(input_desc.getSourceType() == InputSourceType::TABLE);
+      table_infos.push_back({table_id, executor->getTableInfo(table_id)});
+    }
+    CHECK(!table_infos.empty());
+    info_cache.insert(std::make_pair(table_id, table_infos.size() - 1));
+  }
+}
+
+}  // namespace
+
+ChunkMetadataMap synthesize_metadata(const ResultSet* rows) {
   rows->moveToBegin();
   std::vector<std::vector<std::unique_ptr<Encoder>>> dummy_encoders;
   const size_t worker_count = use_parallel_algorithms(*rows) ? cpu_threads() : 1;
@@ -169,7 +220,7 @@ std::map<int, ChunkMetadata> synthesize_metadata(const ResultSet* rows) {
     }
     rows->moveToBegin();
   }
-  std::map<int, ChunkMetadata> metadata_map;
+  ChunkMetadataMap metadata_map;
   for (size_t worker_idx = 1; worker_idx < worker_count; ++worker_idx) {
     CHECK_LT(worker_idx, dummy_encoders.size());
     const auto& worker_encoders = dummy_encoders[worker_idx];
@@ -184,55 +235,6 @@ std::map<int, ChunkMetadata> synthesize_metadata(const ResultSet* rows) {
   }
   return metadata_map;
 }
-
-Fragmenter_Namespace::TableInfo synthesize_table_info(const ResultSetPtr& rows) {
-  std::deque<Fragmenter_Namespace::FragmentInfo> result;
-  if (rows) {
-    result.resize(1);
-    auto& fragment = result.front();
-    fragment.fragmentId = 0;
-    fragment.deviceIds.resize(3);
-    fragment.resultSet = rows.get();
-    fragment.resultSetMutex.reset(new std::mutex());
-  }
-  Fragmenter_Namespace::TableInfo table_info;
-  table_info.fragments = result;
-  return table_info;
-}
-
-void collect_table_infos(std::vector<InputTableInfo>& table_infos,
-                         const std::vector<InputDescriptor>& input_descs,
-                         Executor* executor) {
-  const auto temporary_tables = executor->getTemporaryTables();
-  const auto cat = executor->getCatalog();
-  CHECK(cat);
-  std::unordered_map<int, size_t> info_cache;
-  for (const auto& input_desc : input_descs) {
-    const auto table_id = input_desc.getTableId();
-    const auto cached_index_it = info_cache.find(table_id);
-    if (cached_index_it != info_cache.end()) {
-      CHECK_LT(cached_index_it->second, table_infos.size());
-      table_infos.push_back(
-          {table_id, copy_table_info(table_infos[cached_index_it->second].info)});
-      continue;
-    }
-    if (input_desc.getSourceType() == InputSourceType::RESULT) {
-      CHECK_LT(table_id, 0);
-      CHECK(temporary_tables);
-      const auto it = temporary_tables->find(table_id);
-      LOG_IF(FATAL, it == temporary_tables->end())
-          << "Failed to find previous query result for node " << -table_id;
-      table_infos.push_back({table_id, synthesize_table_info(it->second)});
-    } else {
-      CHECK(input_desc.getSourceType() == InputSourceType::TABLE);
-      table_infos.push_back({table_id, executor->getTableInfo(table_id)});
-    }
-    CHECK(!table_infos.empty());
-    info_cache.insert(std::make_pair(table_id, table_infos.size() - 1));
-  }
-}
-
-}  // namespace
 
 size_t get_frag_count_of_table(const int table_id, Executor* executor) {
   const auto temporary_tables = executor->getTemporaryTables();
@@ -263,8 +265,7 @@ std::vector<InputTableInfo> get_table_infos(const RelAlgExecutionUnit& ra_exe_un
   return table_infos;
 }
 
-const std::map<int, ChunkMetadata>&
-Fragmenter_Namespace::FragmentInfo::getChunkMetadataMap() const {
+const ChunkMetadataMap& Fragmenter_Namespace::FragmentInfo::getChunkMetadataMap() const {
   if (resultSet && !synthesizedMetadataIsValid) {
     chunkMetadataMap = synthesize_metadata(resultSet);
     synthesizedMetadataIsValid = true;

@@ -186,6 +186,7 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     opTab.addOperator(new Truncate());
     opTab.addOperator(new ST_Contains());
     opTab.addOperator(new ST_Intersects());
+    opTab.addOperator(new ST_Overlaps());
     opTab.addOperator(new ST_Disjoint());
     opTab.addOperator(new ST_Within());
     opTab.addOperator(new ST_DWithin());
@@ -239,7 +240,7 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
         continue;
       }
       demangledNames.add(demangledName);
-      opTab.addOperator(new ExtFunction(extSig.getKey(), extSig.getValue()));
+      opTab.addOperator(new ExtFunction(demangledName, extSig.getValue()));
     }
   }
 
@@ -249,7 +250,7 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
       return str;
     }
     assert suffix_idx > 0;
-    return str.substring(0, suffix_idx - 1);
+    return str.substring(0, suffix_idx);
   }
 
   public static class SqlArrayValueConstructorAllowingEmpty
@@ -838,6 +839,32 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
       st_intersects_sig.add(SqlTypeFamily.ANY);
       st_intersects_sig.add(SqlTypeFamily.ANY);
       return st_intersects_sig;
+    }
+  }
+
+  static class ST_Overlaps extends SqlFunction {
+    ST_Overlaps() {
+      super("ST_Overlaps",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 2;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> st_overlaps_sig =
+              new java.util.ArrayList<SqlTypeFamily>();
+      st_overlaps_sig.add(SqlTypeFamily.ANY);
+      st_overlaps_sig.add(SqlTypeFamily.ANY);
+      return st_overlaps_sig;
     }
   }
 
@@ -1568,7 +1595,8 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
               || type == ExtensionFunction.ExtArgumentType.PInt32
               || type == ExtensionFunction.ExtArgumentType.PInt64
               || type == ExtensionFunction.ExtArgumentType.PFloat
-              || type == ExtensionFunction.ExtArgumentType.PDouble;
+              || type == ExtensionFunction.ExtArgumentType.PDouble
+              || type == ExtensionFunction.ExtArgumentType.PBool;
     }
 
     @Override
@@ -1598,6 +1626,8 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
           return ExtensionFunction.ExtArgumentType.Float;
         case PDouble:
           return ExtensionFunction.ExtArgumentType.Double;
+        case PBool:
+          return ExtensionFunction.ExtArgumentType.Bool;
       }
       MAPDLOGGER.error("getValueType: no value for type " + type);
       assert false;
@@ -1627,12 +1657,14 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
         case PInt64:
         case PFloat:
         case PDouble:
+        case PBool:
         case ArrayInt8:
         case ArrayInt16:
         case ArrayInt32:
         case ArrayInt64:
         case ArrayFloat:
         case ArrayDouble:
+        case ArrayBool:
           return SqlTypeName.ARRAY;
         case GeoPoint:
         case GeoLineString:

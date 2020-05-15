@@ -16,11 +16,13 @@
 
 #include "LockMgr/LockMgrImpl.h"
 
-#include "LockMgr/LegacyLockMgr.h"
+#include <string>
 
-#include "Fragmenter/InsertOrderFragmenter.h"
+#include "Catalog/Catalog.h"
+#include "LockMgr/LegacyLockMgr.h"
 #include "QueryEngine/JsonAccessors.h"
 #include "QueryRunner/QueryRunner.h"
+#include "Shared/types.h"
 #include "gen-cpp/CalciteServer.h"
 
 namespace lockmgr {
@@ -33,7 +35,7 @@ ChunkKey chunk_key_for_table(const Catalog_Namespace::Catalog& cat,
     ChunkKey chunk_key{cat.getCurrentDB().dbId, tdp->tableId};
     return chunk_key;
   } else {
-    throw std::runtime_error("Table " + tableName + " does not exist.");
+    throw std::runtime_error("Table/View " + tableName + " does not exist.");
   }
 }
 

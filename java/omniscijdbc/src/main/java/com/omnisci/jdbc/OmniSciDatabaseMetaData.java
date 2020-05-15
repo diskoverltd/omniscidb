@@ -15,19 +15,19 @@
  */
 package com.omnisci.jdbc;
 
-import com.mapd.thrift.server.TColumn;
-import com.mapd.thrift.server.TColumnData;
-import com.mapd.thrift.server.TColumnType;
-import com.mapd.thrift.server.TDBInfo;
-import com.mapd.thrift.server.TDBObject;
-import com.mapd.thrift.server.TDBObjectType;
-import com.mapd.thrift.server.TDatumType;
-import com.mapd.thrift.server.TEncodingType;
-import com.mapd.thrift.server.TQueryResult;
-import com.mapd.thrift.server.TRowSet;
-import com.mapd.thrift.server.TTableDetails;
-import com.mapd.thrift.server.TTablePermissions;
-import com.mapd.thrift.server.TTypeInfo;
+import com.omnisci.thrift.server.TColumn;
+import com.omnisci.thrift.server.TColumnData;
+import com.omnisci.thrift.server.TColumnType;
+import com.omnisci.thrift.server.TDBInfo;
+import com.omnisci.thrift.server.TDBObject;
+import com.omnisci.thrift.server.TDBObjectType;
+import com.omnisci.thrift.server.TDatumType;
+import com.omnisci.thrift.server.TEncodingType;
+import com.omnisci.thrift.server.TQueryResult;
+import com.omnisci.thrift.server.TRowSet;
+import com.omnisci.thrift.server.TTableDetails;
+import com.omnisci.thrift.server.TTablePermissions;
+import com.omnisci.thrift.server.TTypeInfo;
 
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
@@ -930,7 +930,8 @@ SQLException - if a database access error occurs
     // create a rowset for the result
     TRowSet rowSet = new TRowSet(rowDesc, null, columnsList, true);
 
-    TQueryResult result = new TQueryResult(rowSet, 0, 0, null);
+    TQueryResult result = new TQueryResult(
+            rowSet, 0, 0, null, null, true, com.omnisci.thrift.server.TQueryType.UNKNOWN);
 
     OmniSciResultSet tab = new OmniSciResultSet(result, "GetTables");
     return tab;
@@ -993,7 +994,8 @@ SQLException - if a database access error occurs
     // create a rowset for the result
     TRowSet rowSet = new TRowSet(rowDesc, null, columnsList, true);
 
-    TQueryResult result = new TQueryResult(rowSet, 0, 0, null);
+    TQueryResult result = new TQueryResult(
+            rowSet, 0, 0, null, null, true, com.omnisci.thrift.server.TQueryType.UNKNOWN);
 
     OmniSciResultSet schemas = new OmniSciResultSet(result, "getSchemas");
     return schemas;
@@ -1037,7 +1039,8 @@ SQLException - if a database access error occurs
     // create a rowset for the result
     TRowSet rowSet = new TRowSet(rowDesc, null, columnsList, true);
 
-    TQueryResult result = new TQueryResult(rowSet, 0, 0, null);
+    TQueryResult result = new TQueryResult(
+            rowSet, 0, 0, null, null, true, com.omnisci.thrift.server.TQueryType.UNKNOWN);
 
     OmniSciResultSet tab = new OmniSciResultSet(result, "getTableTypes");
 
@@ -1232,7 +1235,8 @@ each row is a column description Throws: SQLException - if a database access err
     // create a rowset for the result
     TRowSet rowSet = new TRowSet(rowDesc, null, columnsList, true);
 
-    TQueryResult result = new TQueryResult(rowSet, 0, 0, null);
+    TQueryResult result = new TQueryResult(
+            rowSet, 0, 0, null, null, true, com.omnisci.thrift.server.TQueryType.UNKNOWN);
 
     OmniSciResultSet cols = new OmniSciResultSet(result, "getColumns");
     return cols;
@@ -1268,7 +1272,8 @@ each row is a column description Throws: SQLException - if a database access err
       columnsList.add(schemaCol);
     }
     TRowSet rowSet = new TRowSet(rowDesc, null, columnsList, true);
-    TQueryResult result = new TQueryResult(rowSet, 0, 0, null);
+    TQueryResult result = new TQueryResult(
+            rowSet, 0, 0, null, null, true, com.omnisci.thrift.server.TQueryType.UNKNOWN);
     OmniSciResultSet cols = new OmniSciResultSet(result, "getColumns");
     return cols;
   }
@@ -1380,7 +1385,8 @@ each row is a column description Throws: SQLException - if a database access err
     // create a rowset for the result
     TRowSet rowSet = new TRowSet(rowDesc, null, columnsList, true);
 
-    TQueryResult result = new TQueryResult(rowSet, 0, 0, null);
+    TQueryResult result = new TQueryResult(
+            rowSet, 0, 0, null, null, true, com.omnisci.thrift.server.TQueryType.UNKNOWN);
 
     OmniSciResultSet cols = new OmniSciResultSet(result, "getPrivileges");
     return cols;
@@ -1638,7 +1644,8 @@ SQLException - if a database access error occurs
     // create a rowset for the result
     TRowSet rowSet = new TRowSet(rowDesc, null, columnsList, true);
 
-    TQueryResult result = new TQueryResult(rowSet, 0, 0, null);
+    TQueryResult result = new TQueryResult(
+            rowSet, 0, 0, null, null, true, com.omnisci.thrift.server.TQueryType.UNKNOWN);
 
     OmniSciResultSet cols = new OmniSciResultSet(result, "getTypeInfo");
     return cols;

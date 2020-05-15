@@ -17,7 +17,7 @@
 #ifndef THRIFT_TYPE_CONVERT_H
 #define THRIFT_TYPE_CONVERT_H
 
-#include "gen-cpp/mapd_types.h"
+#include "gen-cpp/omnisci_types.h"
 
 #include "Logger.h"
 
@@ -144,6 +144,7 @@ inline TEncodingType::type encoding_to_thrift(const SQLTypeInfo& type_info) {
     THRIFT_ENCODING_CASE(SPARSE)
     THRIFT_ENCODING_CASE(GEOINT)
     THRIFT_ENCODING_CASE(DATE_IN_DAYS)
+    THRIFT_ENCODING_CASE(PACKED_PIXEL_COORD)
     default:
       CHECK(false);
   }
@@ -162,6 +163,7 @@ inline EncodingType thrift_to_encoding(const TEncodingType::type tEncodingType) 
     UNTHRIFT_ENCODING_CASE(SPARSE)
     UNTHRIFT_ENCODING_CASE(GEOINT)
     UNTHRIFT_ENCODING_CASE(DATE_IN_DAYS)
+    UNTHRIFT_ENCODING_CASE(PACKED_PIXEL_COORD)
     default:
       CHECK(false);
   }

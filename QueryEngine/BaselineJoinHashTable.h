@@ -94,10 +94,30 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
   size_t payloadBufferOff() const noexcept override;
 
   static auto yieldCacheInvalidator() -> std::function<void()> {
+    VLOG(1) << "Invalidate " << hash_table_cache_.size() << " cached baseline hashtable.";
     return []() -> void {
       std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
       hash_table_cache_.clear();
     };
+  }
+
+  static const std::shared_ptr<std::vector<int8_t>>& getCachedHashTable(size_t idx) {
+    std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
+    CHECK(!hash_table_cache_.empty());
+    CHECK_LT(idx, hash_table_cache_.size());
+    return hash_table_cache_.at(idx).second.buffer;
+  }
+
+  static size_t getEntryCntCachedHashTable(size_t idx) {
+    std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
+    CHECK(!hash_table_cache_.empty());
+    CHECK_LT(idx, hash_table_cache_.size());
+    return hash_table_cache_.at(idx).second.entry_count;
+  }
+
+  static uint64_t getNumberOfCachedHashTables() {
+    std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
+    return hash_table_cache_.size();
   }
 
   virtual ~BaselineJoinHashTable() {}
@@ -126,11 +146,13 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
     const std::vector<JoinColumnTypeInfo> join_column_types;
     const std::vector<std::shared_ptr<Chunk_NS::Chunk>> chunks_owner;
     const std::vector<JoinBucketInfo> join_buckets;
+    const std::vector<std::shared_ptr<void>> malloc_owner;
   };
 
   virtual ColumnsForDevice fetchColumnsForDevice(
-      const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-      const int device_id);
+      const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
+      const int device_id,
+      ThrustAllocator& dev_buff_owner);
 
   virtual std::pair<size_t, size_t> approximateTupleCount(
       const std::vector<ColumnsForDevice>&) const;
@@ -154,11 +176,6 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
 
   virtual llvm::Value* codegenKey(const CompilationOptions&);
 
-  std::pair<const int8_t*, size_t> getAllColumnFragments(
-      const Analyzer::ColumnVar& hash_col,
-      const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-      std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner);
-
   size_t shardCount() const;
 
   Data_Namespace::MemoryLevel getEffectiveMemoryLevel(
@@ -173,12 +190,6 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
   CompositeKeyInfo getCompositeKeyInfo() const;
 
   void reify();
-
-  JoinColumn fetchColumn(const Analyzer::ColumnVar* inner_col,
-                         const Data_Namespace::MemoryLevel& effective_memory_level,
-                         const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-                         std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner,
-                         const int device_id);
 
   void reifyForDevice(const ColumnsForDevice& columns_for_device,
                       const JoinHashTableInterface::HashType layout,
@@ -243,6 +254,12 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
   void freeHashBufferGpuMemory();
   void freeHashBufferCpuMemory();
 
+  bool layoutRequiresAdditionalBuffers(JoinHashTableInterface::HashType layout) const
+      noexcept override {
+    return (layout == JoinHashTableInterface::HashType::ManyToMany ||
+            layout == JoinHashTableInterface::HashType::OneToMany);
+  };
+
   const std::shared_ptr<Analyzer::BinOper> condition_;
   const std::vector<InputTableInfo>& query_infos_;
   const Data_Namespace::MemoryLevel memory_level_;
@@ -256,11 +273,6 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
 #ifdef HAVE_CUDA
   std::vector<Data_Namespace::AbstractBuffer*> gpu_hash_table_buff_;
 #endif
-  typedef std::pair<const int8_t*, size_t> LinearizedColumn;
-  typedef std::pair<int, int> LinearizedColumnCacheKey;
-  std::map<LinearizedColumnCacheKey, LinearizedColumn> linearized_multifrag_columns_;
-  std::mutex linearized_multifrag_column_mutex_;
-  RowSetMemoryOwner linearized_multifrag_column_owner_;
   std::vector<InnerOuter> inner_outer_pairs_;
   const Catalog_Namespace::Catalog* catalog_;
   const int device_count_;

@@ -18,18 +18,22 @@ yay -S \
     doxygen \
     gcc \
     gdal \
+    geos \
     git \
     glbinding \
     go \
     google-glog \
+    intel-tbb \
     jdk-openjdk \
     librdkafka \
     llvm \
     lz4 \
     maven \
+    ninja \
     python-numpy \
     snappy \
     thrift \
+    vulkan-headers \
     wget \
     zlib
 

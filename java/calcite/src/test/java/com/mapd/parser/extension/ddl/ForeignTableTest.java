@@ -6,8 +6,8 @@ import static org.junit.Assert.fail;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.mapd.common.SockTransportProperties;
-import com.mapd.thrift.calciteserver.InvalidParseRequest;
-import com.mapd.thrift.calciteserver.TPlanResult;
+import com.omnisci.thrift.calciteserver.InvalidParseRequest;
+import com.omnisci.thrift.calciteserver.TPlanResult;
 
 import org.junit.Test;
 
@@ -27,26 +27,25 @@ public class ForeignTableTest extends DDLTest {
     assertEquals(expectedJsonObject, actualJsonObject);
   }
 
-  // Decimal tests are disable atm because custom decimal types are disabled.
-  /*
-@Test
-public void createForeignTableDecimal() throws Exception {
-  final JsonObject expectedJsonObject = getJsonFromFile("cft_Decimal.json");
-  final TPlanResult result = processDdlCommand(
-          "CREATE FOREIGN TABLE test_table (test_column_1 DECIMAL(10, 6)) SERVER
-test_server;"); final JsonObject actualJsonObject = gson.fromJson(result.plan_result,
-JsonObject.class); assertEquals(expectedJsonObject, actualJsonObject);
-}
+  @Test
+  public void createForeignTableDecimal() throws Exception {
+    final JsonObject expectedJsonObject = getJsonFromFile("cft_Decimal.json");
+    final TPlanResult result = processDdlCommand(
+            "CREATE FOREIGN TABLE test_table (test_column_1 DECIMAL(10, 6)) SERVER test_server;");
+    final JsonObject actualJsonObject =
+            gson.fromJson(result.plan_result, JsonObject.class);
+    assertEquals(expectedJsonObject, actualJsonObject);
+  }
 
-@Test(expected = InvalidParseRequest.class)
-public void createForeignTableDoubleDecimal() throws Exception {
-  final JsonObject expectedJsonObject = getJsonFromFile("cft_Decimal.json");
-  final TPlanResult result = processDdlCommand(
-          "CREATE FOREIGN TABLE test_table (test_column_1 DECIMAL(10, 6)(11,5)) SERVER
-test_server;"); final JsonObject actualJsonObject = gson.fromJson(result.plan_result,
-JsonObject.class); assertEquals(expectedJsonObject, actualJsonObject);
-}
-  */
+  @Test(expected = InvalidParseRequest.class)
+  public void createForeignTableDoubleDecimal() throws Exception {
+    final JsonObject expectedJsonObject = getJsonFromFile("cft_Decimal.json");
+    final TPlanResult result = processDdlCommand(
+            "CREATE FOREIGN TABLE test_table (test_column_1 DECIMAL(10, 6)(11,5)) SERVER test_server;");
+    final JsonObject actualJsonObject =
+            gson.fromJson(result.plan_result, JsonObject.class);
+    assertEquals(expectedJsonObject, actualJsonObject);
+  }
 
   @Test
   public void createForeignTableIfNotExists() throws Exception {
@@ -197,6 +196,17 @@ JsonObject.class); assertEquals(expectedJsonObject, actualJsonObject);
     final TPlanResult result =
             processDdlCommand("CREATE FOREIGN TABLE test_table (test_column_1 INTEGER) "
                     + "SERVER test_server WITH ( option_1 = 'value_1', option_2 = 2);");
+    final JsonObject actualJsonObject =
+            gson.fromJson(result.plan_result, JsonObject.class);
+    assertEquals(expectedJsonObject, actualJsonObject);
+  }
+
+  @Test
+  public void createForeignTableEscapeOption() throws Exception {
+    final JsonObject expectedJsonObject = getJsonFromFile("cft_EscapeOption.json");
+    final TPlanResult result =
+            processDdlCommand("CREATE FOREIGN TABLE test_table (test_column_1 INTEGER) "
+                    + "SERVER test_server WITH ( escape = '\\');");
     final JsonObject actualJsonObject =
             gson.fromJson(result.plan_result, JsonObject.class);
     assertEquals(expectedJsonObject, actualJsonObject);
@@ -388,6 +398,26 @@ JsonObject.class); assertEquals(expectedJsonObject, actualJsonObject);
     final JsonObject expectedJsonObject = getJsonFromFile("cft_TinyInt.json");
     final TPlanResult result = processDdlCommand(
             "CREATE FOREIGN TABLE test_table (test_column_1 TINYINT) SERVER test_server;");
+    final JsonObject actualJsonObject =
+            gson.fromJson(result.plan_result, JsonObject.class);
+    assertEquals(expectedJsonObject, actualJsonObject);
+  }
+
+  @Test
+  public void createForeignTableArraySized() throws Exception {
+    final JsonObject expectedJsonObject = getJsonFromFile("cft_ArraySized.json");
+    final TPlanResult result = processDdlCommand(
+            "CREATE FOREIGN TABLE test_table (test_column_1 INTEGER[5]) SERVER test_server;");
+    final JsonObject actualJsonObject =
+            gson.fromJson(result.plan_result, JsonObject.class);
+    assertEquals(expectedJsonObject, actualJsonObject);
+  }
+
+  @Test
+  public void createForeignTableArrayUnsized() throws Exception {
+    final JsonObject expectedJsonObject = getJsonFromFile("cft_ArrayUnsized.json");
+    final TPlanResult result = processDdlCommand(
+            "CREATE FOREIGN TABLE test_table (test_column_1 INTEGER[]) SERVER test_server;");
     final JsonObject actualJsonObject =
             gson.fromJson(result.plan_result, JsonObject.class);
     assertEquals(expectedJsonObject, actualJsonObject);

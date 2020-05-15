@@ -35,22 +35,23 @@ class FixedLengthEncoder : public Encoder {
       , dataMax(std::numeric_limits<T>::min())
       , has_nulls(false) {}
 
-  ChunkMetadata appendData(int8_t*& srcData,
-                           const size_t numAppendElems,
-                           const SQLTypeInfo& ti,
-                           const bool replicating = false) override {
-    T* unencodedData = reinterpret_cast<T*>(srcData);
-    auto encodedData = std::make_unique<V[]>(numAppendElems);
-    for (size_t i = 0; i < numAppendElems; ++i) {
+  std::shared_ptr<ChunkMetadata> appendData(int8_t*& src_data,
+                                            const size_t num_elems_to_append,
+                                            const SQLTypeInfo& ti,
+                                            const bool replicating = false,
+                                            const int64_t offset = -1) override {
+    T* unencoded_data = reinterpret_cast<T*>(src_data);
+    auto encoded_data = std::make_unique<V[]>(num_elems_to_append);
+    for (size_t i = 0; i < num_elems_to_append; ++i) {
       size_t ri = replicating ? 0 : i;
-      encodedData.get()[i] = static_cast<V>(unencodedData[ri]);
-      if (unencodedData[ri] != encodedData.get()[i]) {
-        decimal_overflow_validator_.validate(unencodedData[ri]);
+      encoded_data.get()[i] = static_cast<V>(unencoded_data[ri]);
+      if (unencoded_data[ri] != encoded_data.get()[i]) {
+        decimal_overflow_validator_.validate(unencoded_data[ri]);
         LOG(ERROR) << "Fixed encoding failed, Unencoded: " +
-                          std::to_string(unencodedData[ri]) +
-                          " encoded: " + std::to_string(encodedData.get()[i]);
+                          std::to_string(unencoded_data[ri]) +
+                          " encoded: " + std::to_string(encoded_data.get()[i]);
       } else {
-        T data = unencodedData[ri];
+        T data = unencoded_data[ri];
         if (data == std::numeric_limits<V>::min()) {
           has_nulls = true;
         } else {
@@ -60,27 +61,37 @@ class FixedLengthEncoder : public Encoder {
         }
       }
     }
-    num_elems_ += numAppendElems;
 
     // assume always CPU_BUFFER?
-    buffer_->append((int8_t*)(encodedData.get()), numAppendElems * sizeof(V));
-    ChunkMetadata chunkMetadata;
-    getMetadata(chunkMetadata);
-    if (!replicating) {
-      srcData += numAppendElems * sizeof(T);
+    if (offset == -1) {
+      num_elems_ += num_elems_to_append;
+      buffer_->append(reinterpret_cast<int8_t*>(encoded_data.get()),
+                      num_elems_to_append * sizeof(V));
+      if (!replicating) {
+        src_data += num_elems_to_append * sizeof(T);
+      }
+    } else {
+      num_elems_ = offset + num_elems_to_append;
+      CHECK(!replicating);
+      CHECK_GE(offset, 0);
+      buffer_->write(reinterpret_cast<int8_t*>(encoded_data.get()),
+                     num_elems_to_append * sizeof(V),
+                     static_cast<size_t>(offset));
     }
-    return chunkMetadata;
+    auto chunk_metadata = std::make_shared<ChunkMetadata>();
+    getMetadata(chunk_metadata);
+    return chunk_metadata;
   }
 
-  void getMetadata(ChunkMetadata& chunkMetadata) override {
+  void getMetadata(const std::shared_ptr<ChunkMetadata>& chunkMetadata) override {
     Encoder::getMetadata(chunkMetadata);  // call on parent class
-    chunkMetadata.fillChunkStats(dataMin, dataMax, has_nulls);
+    chunkMetadata->fillChunkStats(dataMin, dataMax, has_nulls);
   }
 
   // Only called from the executor for synthesized meta-information.
-  ChunkMetadata getMetadata(const SQLTypeInfo& ti) override {
-    ChunkMetadata chunk_metadata{ti, 0, 0, ChunkStats{}};
-    chunk_metadata.fillChunkStats(dataMin, dataMax, has_nulls);
+  std::shared_ptr<ChunkMetadata> getMetadata(const SQLTypeInfo& ti) override {
+    auto chunk_metadata = std::make_shared<ChunkMetadata>(ti, 0, 0, ChunkStats{});
+    chunk_metadata->fillChunkStats(dataMin, dataMax, has_nulls);
     return chunk_metadata;
   }
 

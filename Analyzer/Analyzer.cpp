@@ -61,7 +61,7 @@ std::shared_ptr<Analyzer::Expr> ColumnVar::deep_copy() const {
 }
 
 void ExpressionTuple::collect_rte_idx(std::set<int>& rte_idx_set) const {
-  for (const auto column : tuple_) {
+  for (const auto& column : tuple_) {
     column->collect_rte_idx(rte_idx_set);
   }
 }
@@ -202,7 +202,7 @@ std::shared_ptr<Analyzer::Expr> WindowFunction::deep_copy() const {
 
 ExpressionPtr ArrayExpr::deep_copy() const {
   return makeExpr<Analyzer::ArrayExpr>(
-      type_info, contained_expressions_, expr_index_, is_null_, local_alloc_);
+      type_info, contained_expressions_, is_null_, local_alloc_);
 }
 
 std::shared_ptr<Analyzer::Expr> GeoExpr::deep_copy() const {
@@ -609,6 +609,13 @@ SQLTypeInfo BinOper::common_numeric_type(const SQLTypeInfo& type1,
     case kNUMERIC:
     case kDECIMAL:
       switch (type2.get_type()) {
+        case kTINYINT:
+          common_type =
+              SQLTypeInfo(kDECIMAL,
+                          std::max(3 + type1.get_scale(), type1.get_dimension()),
+                          type1.get_scale(),
+                          notnull);
+          break;
         case kSMALLINT:
           common_type =
               SQLTypeInfo(kDECIMAL,
@@ -1123,7 +1130,7 @@ void Constant::do_cast(const SQLTypeInfo& new_type_info) {
     }
     type_info = new_type_info;
   } else if (get_is_null() && (new_type_info.is_number() || new_type_info.is_time() ||
-                               new_type_info.is_string())) {
+                               new_type_info.is_string() || new_type_info.is_boolean())) {
     type_info = new_type_info;
     set_null_value();
   } else {
@@ -1200,8 +1207,9 @@ std::shared_ptr<Analyzer::Expr> Constant::add_cast(const SQLTypeInfo& new_type_i
     }
     return Expr::add_cast(new_type_info);
   }
-  if (is_member_of_typeset<kINT, kDECIMAL, kFLOAT, kDOUBLE>(new_type_info) &&
-      is_member_of_typeset<kTIME, kDATE>(type_info)) {
+  const auto is_integral_type =
+      new_type_info.is_integer() || new_type_info.is_decimal() || new_type_info.is_fp();
+  if (is_integral_type && (type_info.is_time() || type_info.is_date())) {
     // Let the codegen phase deal with casts from date/time to a number.
     return makeExpr<UOper>(new_type_info, contains_agg, kCAST, shared_from_this());
   }
@@ -3007,7 +3015,7 @@ bool FunctionOper::operator==(const Expr& rhs) const {
 
 std::string FunctionOper::toString() const {
   std::string str{"(" + name_ + " "};
-  for (const auto arg : args_) {
+  for (const auto& arg : args_) {
     str += arg->toString();
   }
   str += ")";

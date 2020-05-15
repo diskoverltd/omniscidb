@@ -65,18 +65,19 @@ class ArrayNoneEncoder : public Encoder {
     return n - start_idx;
   }
 
-  ChunkMetadata appendData(int8_t*& srcData,
-                           const size_t numAppendElems,
-                           const SQLTypeInfo&,
-                           const bool replicating = false) override {
+  std::shared_ptr<ChunkMetadata> appendData(int8_t*& src_data,
+                                            const size_t num_elems_to_append,
+                                            const SQLTypeInfo& ti,
+                                            const bool replicating = false,
+                                            const int64_t offset = -1) override {
     UNREACHABLE();  // should never be called for arrays
-    return ChunkMetadata{};
+    return nullptr;
   }
 
-  ChunkMetadata appendData(const std::vector<ArrayDatum>* srcData,
-                           const int start_idx,
-                           const size_t numAppendElems,
-                           const bool replicating) {
+  std::shared_ptr<ChunkMetadata> appendData(const std::vector<ArrayDatum>* srcData,
+                                            const int start_idx,
+                                            const size_t numAppendElems,
+                                            const bool replicating) {
     CHECK(index_buf != nullptr);  // index_buf must be set before this.
     size_t index_size = numAppendElems * sizeof(ArrayOffsetT);
     if (num_elems_ == 0) {
@@ -125,8 +126,8 @@ class ArrayNoneEncoder : public Encoder {
 
     size_t inbuf_size =
         std::min(std::max(index_size, data_size), (size_t)MAX_INPUT_BUF_SIZE);
-    auto inbuf = new int8_t[inbuf_size];
-    std::unique_ptr<int8_t[]> gc_inbuf(inbuf);
+    auto gc_inbuf = std::make_unique<int8_t[]>(inbuf_size);
+    auto inbuf = gc_inbuf.get();
     for (size_t num_appended = 0; num_appended < numAppendElems;) {
       ArrayOffsetT* p = (ArrayOffsetT*)inbuf;
       size_t i;
@@ -189,19 +190,20 @@ class ArrayNoneEncoder : public Encoder {
       update_elem_stats((*srcData)[replicating ? 0 : n]);
     }
     num_elems_ += numAppendElems;
-    ChunkMetadata chunkMetadata;
-    getMetadata(chunkMetadata);
-    return chunkMetadata;
+    auto chunk_metadata = std::make_shared<ChunkMetadata>();
+    getMetadata(chunk_metadata);
+    return chunk_metadata;
   }
 
-  void getMetadata(ChunkMetadata& chunkMetadata) override {
+  void getMetadata(const std::shared_ptr<ChunkMetadata>& chunkMetadata) override {
     Encoder::getMetadata(chunkMetadata);  // call on parent class
-    chunkMetadata.fillChunkStats(elem_min, elem_max, has_nulls);
+    chunkMetadata->fillChunkStats(elem_min, elem_max, has_nulls);
   }
 
   // Only called from the executor for synthesized meta-information.
-  ChunkMetadata getMetadata(const SQLTypeInfo& ti) override {
-    ChunkMetadata chunk_metadata{ti, 0, 0, ChunkStats{elem_min, elem_max, has_nulls}};
+  std::shared_ptr<ChunkMetadata> getMetadata(const SQLTypeInfo& ti) override {
+    auto chunk_metadata = std::make_shared<ChunkMetadata>(
+        ti, 0, 0, ChunkStats{elem_min, elem_max, has_nulls});
     return chunk_metadata;
   }
 

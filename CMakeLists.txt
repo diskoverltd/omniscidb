@@ -37,7 +37,7 @@ add_definitions("-DMAPD_EDITION_${MAPD_EDITION}")
 string(TOLOWER "${MAPD_EDITION}" MAPD_EDITION_LOWER)
 
 set(MAPD_VERSION_MAJOR "5")
-set(MAPD_VERSION_MINOR "2")
+set(MAPD_VERSION_MINOR "3")
 set(MAPD_VERSION_PATCH "0")
 set(MAPD_VERSION_EXTRA "dev")
 set(MAPD_VERSION_RAW "${MAPD_VERSION_MAJOR}.${MAPD_VERSION_MINOR}.${MAPD_VERSION_PATCH}${MAPD_VERSION_EXTRA}")
@@ -94,21 +94,6 @@ if(ENABLE_JAVA_REMOTE_DEBUG)
   add_definitions("-DENABLE_JAVA_REMOTE_DEBUG")
 endif()
 
-option(ENABLE_VARLEN_UPDATE "Enable varlen updates" ON )
-if( ENABLE_VARLEN_UPDATE )
-  add_definitions("-DENABLE_VARLEN_UPDATE")
-endif()
-
-option(ENABLE_CALCITE_UPDATE_PATH "Enable Calcite Update Path" ON)
-if( ENABLE_CALCITE_UPDATE_PATH )
-  add_definitions("-DCALCITE_UPDATE_ENABLED")
-endif()
-
-option(ENABLE_CALCITE_DELETE_PATH "Enable Calcite Delete Path" ON)
-if( ENABLE_CALCITE_DELETE_PATH )
-  add_definitions("-DCALCITE_DELETE_ENABLED")
-endif()
-
 option(ENABLE_CUDA "Enable CUDA support" ON)
 if(ENABLE_CUDA)
   find_package(CUDA REQUIRED)
@@ -142,11 +127,6 @@ if(XCODE)
     set(CMAKE_EXE_LINKER_FLAGS "-F/Library/Frameworks -framework CUDA")
   endif()
   add_definitions("-DXCODE")
-endif()
-
-option(ENABLE_ARROW_DEBUG "Enable Arrow Debug Helpers" ON)
-if (ENABLE_ARROW_DEBUG)
-  add_definitions("-DENABLE_ARROW_DEBUG")
 endif()
 
 # fixme: hack works for Homebrew, might not work for Conda
@@ -197,14 +177,8 @@ if (CURSES_HAVE_NCURSES_CURSES_H AND NOT CURSES_HAVE_CURSES_H)
 endif()
 
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR}/bin)
-if(APPLE OR ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"
-    AND (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 3.6 OR CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL 3.6))
-    OR ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 4.9))
-  find_package( Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale REQUIRED )
-else()
-  message(FATAL_ERROR, "GCC v4.9 or clang v3.6 (or newer) is required")
-endif()
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1=1 -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2=1 -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4=1 -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8=1 -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-register")
 endif()
@@ -217,23 +191,11 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
 endif()
 
-option(ENABLE_LLVM_DBG "switch to local debug version of llvm" OFF)
-if(ENABLE_LLVM_DBG)
-  # NOTE: specify LLVM_BIN_DIR to use your local llvm
-  if(XCODE)
-    set(LLVM_BIN_DIR ${CMAKE_SOURCE_DIR}/../llvm/build/xcode/Release/bin)
-  elseif(APPLE)
-    set(LLVM_BIN_DIR ${CMAKE_SOURCE_DIR}/../llvm/build/unix/bin)
-  endif()
-  set(llvm_config_cmd "${LLVM_BIN_DIR}/llvm-config")
-else()
-  set(llvm_config_cmd llvm-config)
-endif()
-
 # address and thread sanitizer
 option(ENABLE_STANDALONE_CALCITE "Require standalone Calcite server" OFF)
 option(ENABLE_ASAN "Enable address sanitizer" OFF)
 option(ENABLE_TSAN "Enable thread sanitizer" OFF)
+option(ENABLE_UBSAN "Enable undefined behavior sanitizer" OFF)
 if(ENABLE_ASAN)
   set(SAN_FLAGS "-fsanitize=address -O1 -fno-omit-frame-pointer")
   add_definitions("-DWITH_DECODERS_BOUNDS_CHECKING")
@@ -244,8 +206,10 @@ elseif(ENABLE_TSAN)
   set(SAN_FLAGS "-fsanitize=thread -fPIC -O1 -fno-omit-frame-pointer")
   # required for older GCC, see https://gcc.gnu.org/bugzilla/show_bug.cgi?id=64354
   add_definitions("-D__SANITIZE_THREAD__")
+elseif(ENABLE_UBSAN)
+  set(SAN_FLAGS "-fsanitize=undefined -fPIC -O1 -fno-omit-frame-pointer")
 endif()
-if(ENABLE_ASAN OR ENABLE_TSAN)
+if(ENABLE_ASAN OR ENABLE_TSAN OR ENABLE_UBSAN)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SAN_FLAGS}")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SAN_FLAGS}")
   set(ENABLE_STANDALONE_CALCITE ON)
@@ -270,36 +234,38 @@ if(ENABLE_STANDALONE_CALCITE)
   add_definitions("-DSTANDALONE_CALCITE")
 endif()
 
-set(llvm_config_inc_arg "--includedir")
-set(llvm_config_ld_arg "--ldflags")
-set(llvm_config_lib_arg "--libs")
-execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_inc_arg}
-    OUTPUT_VARIABLE LLVM_INC_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_lib_arg}
-    OUTPUT_VARIABLE LLVM_LIB_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_ld_arg}
-    OUTPUT_VARIABLE LLVM_LD_FLAGS)
-if(ENABLE_LLVM_DBG)
-  set(llvm_config_obj_arg "--obj-root")
-  execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_obj_arg}
-    OUTPUT_VARIABLE LLVM_BUILD_DIR)
-  string(REPLACE "\n" "" LLVM_BUILD_DIR "${LLVM_BUILD_DIR}")
-  list(APPEND LLVM_INC_FLAGS "${LLVM_BUILD_DIR}/include")
-endif()
-
-if(NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")  # work around linker on centos
-  string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS} ${CURSES_LIBRARIES}")
-else()
-  string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS}")
-endif()
-string(STRIP "${LLVM_LINKER_FLAGS}" LLVM_LINKER_FLAGS)
-include_directories(${Boost_INCLUDE_DIR}
-                    "/usr/local/include"
-                    ${CMAKE_SOURCE_DIR}
+include_directories(${CMAKE_SOURCE_DIR}
                     ${CMAKE_SOURCE_DIR}/Parser
-                    ${CMAKE_CURRENT_BINARY_DIR}
-                    ${LLVM_INC_FLAGS}
-                    "/usr/local/cuda/include/")
+                    ${CMAKE_CURRENT_BINARY_DIR})
+
+## Dependencies
+
+# LLVM
+set(llvm_config_cmd llvm-config)
+
+execute_process(COMMAND ${llvm_config_cmd} "--includedir" OUTPUT_VARIABLE LLVM_INC_FLAGS)
+execute_process(COMMAND ${llvm_config_cmd} "--libs" OUTPUT_VARIABLE LLVM_LIB_FLAGS)
+execute_process(COMMAND ${llvm_config_cmd} "--ldflags" OUTPUT_VARIABLE LLVM_LD_FLAGS)
+execute_process(COMMAND ${llvm_config_cmd} "--version" OUTPUT_VARIABLE LLVM_VERSION_STR)
+string(REGEX MATCH "^([0-9]+)" LLVM_VERSION_MAJOR ${LLVM_VERSION_STR})
+
+string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS} ${CURSES_LIBRARIES}")
+string(STRIP "${LLVM_LINKER_FLAGS}" LLVM_LINKER_FLAGS)
+
+include_directories(${LLVM_INC_FLAGS})
+
+# Boost
+find_package(Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale REQUIRED)
+include_directories(${Boost_INCLUDE_DIR})
+
+# CUDA architecture flags 
+set (CUDA_COMPILATION_ARCH
+  -gencode=arch=compute_30,code=compute_30
+  -gencode=arch=compute_50,code=compute_50
+  -gencode=arch=compute_60,code=compute_60
+  -gencode=arch=compute_70,code=compute_70
+  -gencode=arch=compute_75,code=compute_75
+)
 
 # EGL
 include_directories(ThirdParty/egl)
@@ -311,13 +277,18 @@ endif()
 include_directories(ThirdParty/googletest)
 add_subdirectory(ThirdParty/googletest)
 
+# Google Benchmark
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Suppressing benchmark's tests" FORCE)
+add_subdirectory(ThirdParty/googlebenchmark)
+
 # Arrow
 find_package(Arrow REQUIRED)
 add_definitions("-DARROW_NO_DEPRECATED_API")
 include_directories(${Arrow_INCLUDE_DIRS})
 
 option(ENABLE_IMPORT_PARQUET "Enable Parquet Importer support" ON)
-if(ENABLE_IMPORT_PARQUET)
+# temporarily disable parquet if static linking due to issues with arrow+zstd
+if(ENABLE_IMPORT_PARQUET AND NOT PREFER_STATIC_LIBS)
   find_package(Parquet)
   if(NOT Parquet_FOUND)
     set(ENABLE_IMPORT_PARQUET OFF CACHE BOOL "Enable Parquet Importer support" FORCE)
@@ -330,12 +301,16 @@ if(ENABLE_IMPORT_PARQUET)
   endif()
 endif()
 
+list(APPEND Arrow_LIBRARIES ${Snappy_LIBRARIES})
+if (ENABLE_CUDA)
+  list(INSERT Arrow_LIBRARIES 0 ${Arrow_GPU_CUDA_LIBRARIES})
+endif()
+
 # RapidJSON
 include_directories(ThirdParty/rapidjson)
 add_definitions(-DRAPIDJSON_HAS_STDSTRING)
 
 # Linenoise
-include_directories(ThirdParty/linenoise)
 add_subdirectory(ThirdParty/linenoise)
 
 # SQLite
@@ -361,6 +336,11 @@ if(ENABLE_AWS_S3)
   endif()
 endif()
 
+find_package(CURL REQUIRED QUIET)
+if(CURL_FOUND)
+  set(CURL_LIBRARIES ${LibAwsS3_SUPPORT_LIBRARIES})
+endif()
+
 # bcrypt
 include_directories(ThirdParty/bcrypt)
 add_subdirectory(ThirdParty/bcrypt)
@@ -381,38 +361,53 @@ if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   endif()
 endif()
 
-add_custom_command(
-    DEPENDS ${CMAKE_SOURCE_DIR}/mapd.thrift
-    DEPENDS ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
-    DEPENDS ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
-    OUTPUT
-        ${CMAKE_BINARY_DIR}/gen-cpp/MapD.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/MapD.h
-        ${CMAKE_BINARY_DIR}/gen-cpp/mapd_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/mapd_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
-    COMMAND ${Thrift_EXECUTABLE}
-    ARGS -gen cpp -r -o ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/mapd.thrift)
-list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/gen-cpp/)
+# TBB
+set(TBB_LIBS "")
+find_package(TBB)
+if(TBB_FOUND)
+  message(STATUS "Building with TBB support")
+  add_definitions("-DHAVE_TBB")
+  list(APPEND TBB_LIBS ${TBB_LIBRARIES})
+endif()
 
-add_library(mapd_thrift
-    ${CMAKE_BINARY_DIR}/gen-cpp/MapD.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/MapD.h
-    ${CMAKE_BINARY_DIR}/gen-cpp/mapd_constants.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/mapd_types.cpp
+add_custom_command(
+  DEPENDS
+    ${CMAKE_SOURCE_DIR}/omnisci.thrift
+    ${CMAKE_SOURCE_DIR}/common.thrift
+    ${CMAKE_SOURCE_DIR}/completion_hints.thrift
+    ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
+    ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
+  OUTPUT
+    ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.h
+    ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_constants.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_types.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_constants.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_types.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_constants.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp)
+    ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_constants.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
+  COMMAND ${Thrift_EXECUTABLE}
+  ARGS -gen cpp -r -o ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/omnisci.thrift)
+list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/gen-cpp/)
+
+add_library(mapd_thrift
+  ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.h
+  ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
+)
 
 target_compile_options(mapd_thrift PRIVATE -fPIC)
 target_link_libraries(mapd_thrift ${Thrift_LIBRARIES})
@@ -476,31 +471,32 @@ add_subdirectory(Calcite)
 get_target_property(CalciteThrift_BINARY_DIR calciteserver_thrift BINARY_DIR)
 include_directories(${CalciteThrift_BINARY_DIR})
 
-add_subdirectory(Distributed)
-
 add_subdirectory(Catalog)
 add_subdirectory(Parser)
 add_subdirectory(Analyzer)
-add_subdirectory(Planner)
 add_subdirectory(Import)
 add_subdirectory(QueryEngine)
 add_subdirectory(DataMgr)
 add_subdirectory(CudaMgr)
 add_subdirectory(LockMgr)
+add_subdirectory(MigrationMgr)
 add_subdirectory(Fragmenter)
 add_subdirectory(Chunk)
 add_subdirectory(Shared)
 add_subdirectory(Utils)
 add_subdirectory(QueryRunner)
 add_subdirectory(SQLFrontend)
+add_subdirectory(TableArchiver)
 add_subdirectory(ThriftHandler)
+
+add_subdirectory(Distributed)
 
 option(ENABLE_ODBC "Build ODBC driver" OFF)
 if(ENABLE_ODBC)
   add_subdirectory(ODBC)
 endif()
 
-set(MAPD_LIBRARIES Shared Catalog SqliteConnector Parser Analyzer Planner CsvImport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter Chunk)
+set(MAPD_LIBRARIES Shared Catalog SqliteConnector MigrationMgr TableArchiver Parser Analyzer CsvImport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter Chunk)
 
 if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   list(APPEND MAPD_LIBRARIES Distributed)
@@ -516,7 +512,6 @@ if(ENABLE_RENDERING)
   list(APPEND MAPD_LIBRARIES "${MAPD_RENDERING_LIBRARIES}")
 endif()
 
-list(APPEND Arrow_LIBRARIES ${Snappy_LIBRARIES})
 list(APPEND MAPD_LIBRARIES ${Arrow_LIBRARIES})
 
 if(ENABLE_FOLLY)
@@ -526,6 +521,8 @@ endif()
 if(ENABLE_LICENSING_AWS)
   list(APPEND MAPD_LIBRARIES AWSMarketplace)
 endif()
+
+list(APPEND MAPD_LIBRARIES ${TBB_LIBS})
 
 option(ENABLE_TESTS "Build unit tests" ON)
 if (ENABLE_TESTS)
@@ -542,25 +539,25 @@ endif()
 set(initdb_source_files initdb.cpp)
 add_executable(initdb ${initdb_source_files})
 
-set(omnisci_server_source_files MapDServer.cpp ${CMAKE_BINARY_DIR}/MapDRelease.h ${CMAKE_SOURCE_DIR}/Shared/ConfigResolve.h)
+set(omnisci_server_source_files MapDServer.cpp ${CMAKE_BINARY_DIR}/MapDRelease.h)
 
 add_executable(omnisci_server ${omnisci_server_source_files})
 set_target_properties(omnisci_server PROPERTIES COMPILE_DEFINITIONS "${TIME_LIMITED_DEFINITIONS}")
 
 add_custom_command(
-    DEPENDS ${CMAKE_SOURCE_DIR}/mapd.thrift
+    DEPENDS ${CMAKE_SOURCE_DIR}/omnisci.thrift
     OUTPUT
-        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/mapd/thrift/server/MapD.java
-        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/mapd/thrift/server/TRow.java
+        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/OmniSci.java
+        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/TRow.java
     COMMAND mkdir
     ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
-    ARGS -gen java -r -out ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/ ${CMAKE_SOURCE_DIR}/mapd.thrift)
+    ARGS -gen java -r -out ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/ ${CMAKE_SOURCE_DIR}/omnisci.thrift)
 
 add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/common.thrift
     OUTPUT
-        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/mapd/thrift/server/common.java
+        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/common.java
     COMMAND mkdir
     ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
@@ -569,15 +566,15 @@ add_custom_command(
 add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
     OUTPUT
-        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/mapd/thrift/server/serialized_result_set.java
+        ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/serialized_result_set.java
     COMMAND mkdir
     ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
     ARGS -gen java -r -out ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/ ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift)
 
 add_custom_command(
-    DEPENDS ${CMAKE_SOURCE_DIR}/java/thrift/calciteserver.thrift ${CMAKE_SOURCE_DIR}/completion_hints.thrift
-    OUTPUT ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/mapd/thrift/calciteserver/CalciteServer.java
+    DEPENDS ${CMAKE_SOURCE_DIR}/java/thrift/calciteserver.thrift ${CMAKE_SOURCE_DIR}/completion_hints.thrift ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
+    OUTPUT ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/calciteserver/CalciteServer.java
     COMMAND mkdir
     ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
@@ -609,9 +606,9 @@ add_custom_target(rerun_cmake ALL
   )
 add_dependencies(omnisci_server rerun_cmake)
 
-target_link_libraries(omnisci_server mapd_thrift thrift_handler ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${LLVM_LINKER_FLAGS} ${PROFILER_LIBS} ${CURSES_LIBRARIES} ${ZLIB_LIBRARIES} ${LOCALE_LINK_FLAG})
+target_link_libraries(omnisci_server mapd_thrift thrift_handler ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${PROFILER_LIBS} ${ZLIB_LIBRARIES} ${LOCALE_LINK_FLAG})
 
-target_link_libraries(initdb mapd_thrift DataMgr ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${LLVM_LINKER_FLAGS} ${CURSES_LIBRARIES} ${ZLIB_LIBRARIES})
+target_link_libraries(initdb mapd_thrift DataMgr ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${ZLIB_LIBRARIES})
 
 macro(set_dpkg_arch arch_in arch_out)
   if("${arch_in}" STREQUAL "x86_64")
@@ -694,24 +691,12 @@ if(MAPD_IMMERSE_DOWNLOAD)
   install(DIRECTORY ${source_dir}/ DESTINATION "frontend/" PATTERN .git EXCLUDE PATTERN node_modules EXCLUDE)
   add_custom_command(TARGET frontend COMMAND ${CMAKE_COMMAND} -E copy_directory ${source_dir} frontend)
   list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/frontend)
-endif()
 
-## Go web server
-find_program(GO_EXECUTABLE NAMES go)
-if(NOT GO_EXECUTABLE)
-  message(FATAL_ERROR "go not found. Install Go(lang).")
+  ## Go web server
+  if("${MAPD_EDITION_LOWER}" STREQUAL "ee" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Immerse")
+    add_subdirectory(Immerse)
+  endif()
 endif()
-file(GLOB_RECURSE GOLANG_SOURCES RELATIVE ${CMAKE_SOURCE_DIR} ThirdParty/go/src/mapd/vendor/**/*.go)
-add_custom_command(
-  OUTPUT ${CMAKE_BINARY_DIR}/bin/omnisci_web_server
-  COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/ThirdParty/go/src/mapd/vendor/ ${CMAKE_BINARY_DIR}/go/src/
-  COMMAND GOPATH=${CMAKE_BINARY_DIR}/go ${GO_EXECUTABLE} build -ldflags "-X main.version=${CPACK_PACKAGE_VERSION}" -o ${CMAKE_BINARY_DIR}/bin/omnisci_web_server ${CMAKE_SOURCE_DIR}/OmniSciWebServer.go
-  DEPENDS OmniSciWebServer.go ${GOLANG_SOURCES}
-  )
-add_custom_target(omnisci_web_server ALL DEPENDS ${CMAKE_BINARY_DIR}/bin/omnisci_web_server)
-install(PROGRAMS ${CMAKE_BINARY_DIR}/bin/omnisci_web_server DESTINATION bin)
-list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/bin/omnisci_web_server)
-list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/go)
 
 add_subdirectory(ThirdParty/generate_cert)
 
@@ -743,7 +728,6 @@ if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
     install(FILES systemd/omnisci-sds.conf.in DESTINATION systemd)
   endif()
   install(FILES systemd/omnisci_server.service.in systemd/omnisci_server@.service.in DESTINATION systemd)
-  install(FILES systemd/omnisci_web_server.service.in systemd/omnisci_web_server@.service.in DESTINATION systemd)
   install(FILES systemd/omnisci.conf.in DESTINATION systemd)
   install(PROGRAMS systemd/install_omnisci_systemd.sh DESTINATION systemd)
 endif()
@@ -774,10 +758,10 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/calcite/target/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar ${CMAKE_BINARY_DIR}/bin
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/java
   DEPENDS
-    ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/mapd/thrift/server/MapD.java
-    ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/mapd/thrift/calciteserver/CalciteServer.java
+    ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/OmniSci.java
+    ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/calciteserver/CalciteServer.java
     ${CMAKE_SOURCE_DIR}/java/pom.xml
-    ${CMAKE_SOURCE_DIR}/mapd.thrift
+    ${CMAKE_SOURCE_DIR}/omnisci.thrift
     ${JAVA_POM}
     ${JAVA_SOURCES}
   )
@@ -802,7 +786,7 @@ if(ENABLE_CUDA)
   install(FILES ${CMAKE_BINARY_DIR}/QueryEngine/cuda_mapd_rt.a DESTINATION QueryEngine)
 endif()
 install(FILES completion_hints.thrift DESTINATION ".")
-install(FILES mapd.thrift DESTINATION ".")
+install(FILES omnisci.thrift DESTINATION ".")
 install(FILES common.thrift DESTINATION ".")
 install(FILES QueryEngine/serialized_result_set.thrift DESTINATION "QueryEngine/")
 
@@ -830,18 +814,21 @@ install(PROGRAMS insert_sample_data DESTINATION ".")
 if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   install(DIRECTORY docker/sds DESTINATION "docker")
 endif()
-install(FILES docker/Dockerfile docker/Dockerfile.mapd docker/README.md DESTINATION "docker")
+install(FILES docker/README.md DESTINATION "docker")
+if(ENABLE_CUDA)
+  install(FILES docker/Dockerfile.cuda RENAME Dockerfile DESTINATION "docker")
+else()
+  install(FILES docker/Dockerfile.cpu RENAME Dockerfile DESTINATION "docker")
+endif()
 
 execute_process(
   COMMAND ln -sf omnisql mapdql
   COMMAND ln -sf omnisci_server mapd_server
-  COMMAND ln -sf omnisci_web_server mapd_web_server
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
 install(FILES
   ${CMAKE_BINARY_DIR}/bin/mapdql
   ${CMAKE_BINARY_DIR}/bin/mapd_server
-  ${CMAKE_BINARY_DIR}/bin/mapd_web_server
   DESTINATION "bin"
   )
 execute_process(
@@ -868,3 +855,8 @@ if(DOXYGEN_FOUND)
 
   add_dependencies(sphinx doxygen)
 endif(DOXYGEN_FOUND)
+
+option(ENABLE_FSI "Enable Foreign Storage Interface" OFF)
+if(ENABLE_FSI)
+  add_definitions("-DENABLE_FSI")
+endif()

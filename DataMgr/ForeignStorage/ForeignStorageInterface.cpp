@@ -94,7 +94,7 @@ void ForeignStorageBufferMgr::fetchBuffer(const ChunkKey& key,
 }
 
 void ForeignStorageBufferMgr::getChunkMetadataVecForKeyPrefix(
-    std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec,
+    ChunkMetadataVector& chunkMetadataVec,
     const ChunkKey& keyPrefix) {
   mapd_unique_lock<mapd_shared_mutex> chunk_index_write_lock(
       chunk_index_mutex_);  // is this guarding the right structure?  it look slike we
@@ -119,14 +119,16 @@ void ForeignStorageBufferMgr::getChunkMetadataVecForKeyPrefix(
         subkey[4] = 2;
         auto& index_buf = *(chunk_index_.find(subkey)->second);
         auto bs = index_buf.size() / index_buf.sql_type.get_size();
-        ChunkMetadata m{type, size, bs, ChunkStats{}};
-        chunkMetadataVec.emplace_back(chunk_key, m);
+        auto chunk_metadata =
+            std::make_shared<ChunkMetadata>(type, size, bs, ChunkStats{});
+        chunkMetadataVec.emplace_back(chunk_key, chunk_metadata);
       }
     } else {
       const auto& buffer = *chunk_it->second;
-      ChunkMetadata m{buffer.sql_type};
-      buffer.encoder->getMetadata(m);
-      chunkMetadataVec.emplace_back(chunk_key, m);
+      auto chunk_metadata = std::make_shared<ChunkMetadata>();
+      chunk_metadata->sqlType = buffer.sql_type;
+      buffer.encoder->getMetadata(chunk_metadata);
+      chunkMetadataVec.emplace_back(chunk_key, chunk_metadata);
     }
     chunk_it++;
   }
@@ -163,7 +165,7 @@ void ForeignStorageInterface::registerPersistentStorageInterface(
 
 std::pair<std::string, std::string> parseStorageType(const std::string& type) {
   size_t sep = type.find_first_of(':'), sep2 = sep != std::string::npos ? sep + 1 : sep;
-  auto res = std::make_pair(type.substr(0, sep), type.substr(sep2));
+  auto res = std::make_pair(to_upper(type.substr(0, sep)), type.substr(sep2));
   return res;
 }
 
@@ -174,7 +176,9 @@ void ForeignStorageInterface::prepareTable(const int db_id,
   std::unique_lock<std::mutex> persistent_storage_interfaces_lock(
       persistent_storage_interfaces_mutex_);
   const auto it = persistent_storage_interfaces_.find(type.first);
-  CHECK(it != persistent_storage_interfaces_.end());
+  if (it == persistent_storage_interfaces_.end()) {
+    throw std::runtime_error("storage type " + type.first + " not supported");
+  }
   auto& p = it->second;
   persistent_storage_interfaces_lock.unlock();
   p->prepareTable(db_id, type.second, td, cols);
@@ -189,7 +193,9 @@ void ForeignStorageInterface::registerTable(Catalog_Namespace::Catalog* catalog,
   std::unique_lock<std::mutex> persistent_storage_interfaces_lock(
       persistent_storage_interfaces_mutex_);
   const auto it = persistent_storage_interfaces_.find(type.first);
-  CHECK(it != persistent_storage_interfaces_.end());
+  if (it == persistent_storage_interfaces_.end()) {
+    throw std::runtime_error("storage type " + type.first + " not supported");
+  }
 
   auto db_id = catalog->getCurrentDB().dbId;
   const auto it_ok = table_persistent_storage_interface_map_.emplace(

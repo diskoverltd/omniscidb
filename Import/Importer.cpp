@@ -27,7 +27,6 @@
 #include <gdal.h>
 #include <ogrsf_frmts.h>
 #include <unistd.h>
-
 #include <boost/algorithm/string.hpp>
 #include <boost/dynamic_bitset.hpp>
 #include <boost/filesystem.hpp>
@@ -51,26 +50,27 @@
 #include <utility>
 #include <vector>
 
-#include "../Archive/PosixFileArchive.h"
-#include "../Archive/S3Archive.h"
-#include "../QueryEngine/TypePunning.h"
-#include "../Shared/geo_compression.h"
-#include "../Shared/geo_types.h"
-#include "../Shared/geosupport.h"
-#include "../Shared/import_helpers.h"
-#include "../Shared/mapd_glob.h"
-#include "../Shared/mapdpath.h"
-#include "../Shared/measure.h"
-#include "../Shared/scope.h"
-#include "../Shared/shard_key.h"
-#include "../Shared/thread_count.h"
+#include "Archive/PosixFileArchive.h"
+#include "Archive/S3Archive.h"
 #include "ArrowImporter.h"
 #include "Import/DelimitedParserUtils.h"
+#include "QueryEngine/TypePunning.h"
 #include "QueryRunner/QueryRunner.h"
 #include "Shared/Logger.h"
 #include "Shared/SqlTypesLayout.h"
+#include "Shared/geo_compression.h"
+#include "Shared/geo_types.h"
+#include "Shared/geosupport.h"
+#include "Shared/import_helpers.h"
+#include "Shared/mapd_glob.h"
+#include "Shared/mapdpath.h"
+#include "Shared/measure.h"
+#include "Shared/scope.h"
+#include "Shared/shard_key.h"
+#include "Shared/thread_count.h"
 #include "Utils/ChunkAccessorTable.h"
-#include "gen-cpp/MapD.h"
+
+#include "gen-cpp/OmniSci.h"
 
 size_t g_archive_read_buf_size = 1 << 20;
 
@@ -227,42 +227,6 @@ static const std::string trim_space(const char* field, const size_t len) {
     j--;
   }
   return std::string(field + i, j - i);
-}
-
-int8_t* appendDatum(int8_t* buf, Datum d, const SQLTypeInfo& ti) {
-  switch (ti.get_type()) {
-    case kBOOLEAN:
-      *(bool*)buf = d.boolval;
-      return buf + sizeof(bool);
-    case kNUMERIC:
-    case kDECIMAL:
-    case kBIGINT:
-      *(int64_t*)buf = d.bigintval;
-      return buf + sizeof(int64_t);
-    case kINT:
-      *(int32_t*)buf = d.intval;
-      return buf + sizeof(int32_t);
-    case kSMALLINT:
-      *(int16_t*)buf = d.smallintval;
-      return buf + sizeof(int16_t);
-    case kTINYINT:
-      *(int8_t*)buf = d.tinyintval;
-      return buf + sizeof(int8_t);
-    case kFLOAT:
-      *(float*)buf = d.floatval;
-      return buf + sizeof(float);
-    case kDOUBLE:
-      *(double*)buf = d.doubleval;
-      return buf + sizeof(double);
-    case kTIME:
-    case kTIMESTAMP:
-    case kDATE:
-      *reinterpret_cast<int64_t*>(buf) = d.bigintval;
-      return buf + sizeof(int64_t);
-    default:
-      return NULL;
-  }
-  return NULL;
 }
 
 Datum NullDatum(SQLTypeInfo& ti) {
@@ -501,6 +465,34 @@ ArrayDatum TDatumToArrayDatum(const TDatum& datum, const SQLTypeInfo& ti) {
   }
 
   return ArrayDatum(len, buf, false);
+}
+
+void TypedImportBuffer::addDictEncodedString(const std::vector<std::string>& string_vec) {
+  CHECK(string_dict_);
+  std::vector<std::string_view> string_view_vec;
+  string_view_vec.reserve(string_vec.size());
+  for (const auto& str : string_vec) {
+    if (str.size() > StringDictionary::MAX_STRLEN) {
+      throw std::runtime_error("String too long for dictionary encoding.");
+    }
+    string_view_vec.push_back(str);
+  }
+  switch (column_desc_->columnType.get_size()) {
+    case 1:
+      string_dict_i8_buffer_->resize(string_view_vec.size());
+      string_dict_->getOrAddBulk(string_view_vec, string_dict_i8_buffer_->data());
+      break;
+    case 2:
+      string_dict_i16_buffer_->resize(string_view_vec.size());
+      string_dict_->getOrAddBulk(string_view_vec, string_dict_i16_buffer_->data());
+      break;
+    case 4:
+      string_dict_i32_buffer_->resize(string_view_vec.size());
+      string_dict_->getOrAddBulk(string_view_vec, string_dict_i32_buffer_->data());
+      break;
+    default:
+      CHECK(false);
+  }
 }
 
 void TypedImportBuffer::add_value(const ColumnDescriptor* cd,
@@ -771,7 +763,7 @@ size_t TypedImportBuffer::convert_arrow_val_to_import_buffer(
   std::function<void(const int64_t)> f_add_geo_phy_cols = [&](const int64_t row) {};
   if (bad_rows_tracker && cd->columnType.is_geometry()) {
     f_add_geo_phy_cols = [&](const int64_t row) {
-      // Populate physical columns (ref. MapDHandler::load_table)
+      // Populate physical columns (ref. DBHandler::load_table)
       std::vector<double> coords, bounds;
       std::vector<int> ring_sizes, poly_rings;
       int render_group = 0;
@@ -1416,70 +1408,6 @@ bool importGeoFromLonLat(double lon, double lat, std::vector<double>& coords) {
   return true;
 }
 
-uint64_t compress_coord(double coord, const SQLTypeInfo& ti, bool x) {
-  if (ti.get_compression() == kENCODING_GEOINT && ti.get_comp_param() == 32) {
-    return x ? Geo_namespace::compress_longitude_coord_geoint32(coord)
-             : Geo_namespace::compress_lattitude_coord_geoint32(coord);
-  }
-  return *reinterpret_cast<uint64_t*>(may_alias_ptr(&coord));
-}
-
-uint64_t compress_null_point(const SQLTypeInfo& ti, bool x) {
-  if (ti.get_compression() == kENCODING_GEOINT && ti.get_comp_param() == 32) {
-    return x ? Geo_namespace::compress_null_point_longitude_geoint32()
-             : Geo_namespace::compress_null_point_lattitude_geoint32();
-  }
-  double n = x ? NULL_ARRAY_DOUBLE : NULL_DOUBLE;
-  auto u = *reinterpret_cast<uint64_t*>(may_alias_ptr(&n));
-  return u;
-}
-
-// Compress non-NULL geo coords; and also NULL POINT coords (special case)
-std::vector<uint8_t> compress_coords(std::vector<double>& coords, const SQLTypeInfo& ti) {
-  CHECK(!coords.empty()) << "Coord compression received no data";
-  bool is_null_point = false;
-  if (!ti.get_notnull()) {
-    is_null_point = (ti.get_type() == kPOINT && coords[0] == NULL_ARRAY_DOUBLE);
-  }
-  std::vector<uint8_t> compressed_coords;
-  bool x = true;
-  bool is_geoint32 =
-      (ti.get_compression() == kENCODING_GEOINT && ti.get_comp_param() == 32);
-  size_t coord_data_size = (is_geoint32) ? (ti.get_comp_param() / 8) : sizeof(double);
-  for (auto coord : coords) {
-    uint64_t coord_data;
-    if (is_null_point) {
-      coord_data = compress_null_point(ti, x);
-    } else {
-      if (ti.get_output_srid() == 4326) {
-        if (x) {
-          if (coord < -180.0 || coord > 180.0) {
-            throw std::runtime_error("WGS84 longitude " + std::to_string(coord) +
-                                     " is out of bounds");
-          }
-        } else {
-          if (coord < -90.0 || coord > 90.0) {
-            throw std::runtime_error("WGS84 latitude " + std::to_string(coord) +
-                                     " is out of bounds");
-          }
-        }
-      }
-      if (is_geoint32) {
-        coord_data = compress_coord(coord, ti, x);
-      } else {
-        auto coord_data_ptr = reinterpret_cast<uint64_t*>(&coord);
-        coord_data = *coord_data_ptr;
-      }
-    }
-    for (size_t i = 0; i < coord_data_size; i++) {
-      compressed_coords.push_back(coord_data & 0xFF);
-      coord_data >>= 8;
-    }
-    x = !x;
-  }
-  return compressed_coords;
-}
-
 void Importer::set_geo_physical_import_buffer(
     const Catalog_Namespace::Catalog& catalog,
     const ColumnDescriptor* cd,
@@ -1517,7 +1445,7 @@ void Importer::set_geo_physical_import_buffer(
   // One exception - NULL POINT geo: coords need to be processed to encode nullness
   // in a fixlen array, compressed and uncompressed.
   if (!is_null_geo) {
-    std::vector<uint8_t> compressed_coords = compress_coords(coords, col_ti);
+    std::vector<uint8_t> compressed_coords = geospatial::compress_coords(coords, col_ti);
     for (auto cc : compressed_coords) {
       TDatum td_byte;
       td_byte.val.int_val = cc;
@@ -1629,7 +1557,8 @@ void Importer::set_geo_physical_import_buffer_columnar(
     }
     std::vector<TDatum> td_coords_data;
     if (!is_null_geo) {
-      std::vector<uint8_t> compressed_coords = compress_coords(coords, col_ti);
+      std::vector<uint8_t> compressed_coords =
+          geospatial::compress_coords(coords, col_ti);
       for (auto cc : compressed_coords) {
         TDatum td_byte;
         td_byte.val.int_val = cc;
@@ -2331,7 +2260,8 @@ static ImportStatus import_thread_shapefile(
             auto cd_coords = *cd_it;
             std::vector<TDatum> td_coord_data;
             if (!is_null_geo) {
-              std::vector<uint8_t> compressed_coords = compress_coords(coords, col_ti);
+              std::vector<uint8_t> compressed_coords =
+                  geospatial::compress_coords(coords, col_ti);
               for (auto cc : compressed_coords) {
                 TDatum td_byte;
                 td_byte.val.int_val = cc;
@@ -2700,6 +2630,10 @@ bool Loader::loadImpl(
     const std::vector<std::unique_ptr<TypedImportBuffer>>& import_buffers,
     size_t row_count,
     bool checkpoint) {
+  if (load_callback_) {
+    auto data_blocks = get_data_block_pointers(import_buffers);
+    return load_callback_(import_buffers, data_blocks, row_count);
+  }
   if (table_desc_->nShards) {
     std::vector<OneShardBuffers> all_shard_import_buffers;
     std::vector<size_t> all_shard_row_counts;
@@ -3243,11 +3177,13 @@ void Importer::load(const std::vector<std::unique_ptr<TypedImportBuffer>>& impor
 }
 
 void Importer::checkpoint(const int32_t start_epoch) {
-  if (load_failed) {
-    // rollback to starting epoch - undo all the added records
-    loader->setTableEpoch(start_epoch);
-  } else {
-    loader->checkpoint();
+  if (loader->getTableDesc()->storageType != StorageType::FOREIGN_TABLE) {
+    if (load_failed) {
+      // rollback to starting epoch - undo all the added records
+      loader->setTableEpoch(start_epoch);
+    } else {
+      loader->checkpoint();
+    }
   }
 
   if (loader->getTableDesc()->persistenceLevel ==
@@ -3314,10 +3250,11 @@ inline auto open_parquet_table(const std::string& file_path,
                                std::unique_ptr<parquet::arrow::FileReader>& reader,
                                std::shared_ptr<arrow::Table>& table) {
   using namespace parquet::arrow;
-  using ReadableFile = arrow::io::ReadableFile;
-  auto mempool = arrow::default_memory_pool();
-  PARQUET_THROW_NOT_OK(ReadableFile::Open(file_path, mempool, &infile));
-  PARQUET_THROW_NOT_OK(OpenFile(infile, mempool, &reader));
+  auto file_result = arrow::io::ReadableFile::Open(file_path);
+  PARQUET_THROW_NOT_OK(file_result.status());
+  infile = file_result.ValueOrDie();
+
+  PARQUET_THROW_NOT_OK(OpenFile(infile, arrow::default_memory_pool(), &reader));
   PARQUET_THROW_NOT_OK(reader->ReadTable(&table));
   const auto num_row_groups = reader->num_row_groups();
   const auto num_columns = table->num_columns();
@@ -3348,7 +3285,7 @@ void Detector::import_local_parquet(const std::string& file_path) {
       if (c) {
         raw_data += copy_params.delimiter;
       }
-      raw_data += table->column(c)->name();
+      raw_data += table->ColumnNames().at(c);
     }
     raw_data += copy_params.line_delim;
   }
@@ -5000,16 +4937,25 @@ void RenderGroupAnalyzer::seedFromExistingTableContents(
   // start timer
   auto seedTimer = timer_start();
 
+  // start with a fresh tree
+  _rtree = nullptr;
+  _numRenderGroups = 0;
+
   // get the table descriptor
   const auto& cat = loader->getCatalog();
+  if (loader->getTableDesc()->storageType == StorageType::FOREIGN_TABLE) {
+    if (DEBUG_RENDER_GROUP_ANALYZER) {
+      LOG(INFO) << "DEBUG: Table is a foreign table";
+    }
+    _rtree = std::make_unique<RTree>();
+    CHECK(_rtree);
+    return;
+  }
+
   const std::string& tableName = loader->getTableDesc()->tableName;
   const auto td = cat.getMetadataForTable(tableName);
   CHECK(td);
   CHECK(td->fragmenter);
-
-  // start with a fresh tree
-  _rtree = nullptr;
-  _numRenderGroups = 0;
 
   // if the table is empty, just make an empty tree
   if (td->fragmenter->getFragmentsForQuery().getPhysicalNumTuples() == 0) {
@@ -5164,104 +5110,19 @@ int RenderGroupAnalyzer::insertBoundsAndReturnRenderGroup(
   return firstAvailableRenderGroup;
 }
 
-ImportDriver::ImportDriver(std::shared_ptr<Catalog_Namespace::Catalog> cat,
-                           const Catalog_Namespace::UserMetadata& user,
-                           const ExecutorDeviceType dt)
-    : QueryRunner(std::make_unique<Catalog_Namespace::SessionInfo>(cat, user, dt, "")) {}
+std::vector<std::unique_ptr<TypedImportBuffer>> setup_column_loaders(
+    const TableDescriptor* td,
+    Loader* loader) {
+  CHECK(td);
+  auto col_descs = loader->get_column_descs();
 
-void ImportDriver::importGeoTable(const std::string& file_path,
-                                  const std::string& table_name,
-                                  const bool compression,
-                                  const bool create_table,
-                                  const bool explode_collections) {
-  CHECK(session_info_);
-  const std::string geo_column_name(OMNISCI_GEO_PREFIX);
-
-  CopyParams copy_params;
-  if (compression) {
-    copy_params.geo_coords_encoding = EncodingType::kENCODING_GEOINT;
-    copy_params.geo_coords_comp_param = 32;
-  } else {
-    copy_params.geo_coords_encoding = EncodingType::kENCODING_NONE;
-    copy_params.geo_coords_comp_param = 0;
-  }
-  copy_params.geo_assign_render_groups = true;
-  copy_params.geo_explode_collections = explode_collections;
-
-  auto cds = Importer::gdalToColumnDescriptors(file_path, geo_column_name, copy_params);
-  std::map<std::string, std::string> colname_to_src;
-  for (auto& cd : cds) {
-    const auto col_name_sanitized = ImportHelpers::sanitize_name(cd.columnName);
-    const auto ret =
-        colname_to_src.insert(std::make_pair(col_name_sanitized, cd.columnName));
-    CHECK(ret.second);
-    cd.columnName = col_name_sanitized;
+  std::vector<std::unique_ptr<TypedImportBuffer>> import_buffers;
+  for (auto cd : col_descs) {
+    import_buffers.emplace_back(
+        std::make_unique<TypedImportBuffer>(cd, loader->getStringDict(cd)));
   }
 
-  auto& cat = session_info_->getCatalog();
-
-  if (create_table) {
-    const auto td = cat.getMetadataForTable(table_name);
-    if (td != nullptr) {
-      throw std::runtime_error("Error: Table " + table_name +
-                               " already exists. Possible failure to correctly re-create "
-                               "mapd_data directory.");
-    }
-    if (table_name != ImportHelpers::sanitize_name(table_name)) {
-      throw std::runtime_error("Invalid characters in table name: " + table_name);
-    }
-
-    std::string stmt{"CREATE TABLE " + table_name};
-    std::vector<std::string> col_stmts;
-
-    for (auto& cd : cds) {
-      if (cd.columnType.get_type() == SQLTypes::kINTERVAL_DAY_TIME ||
-          cd.columnType.get_type() == SQLTypes::kINTERVAL_YEAR_MONTH) {
-        throw std::runtime_error(
-            "Unsupported type: INTERVAL_DAY_TIME or INTERVAL_YEAR_MONTH for col " +
-            cd.columnName + " (table: " + table_name + ")");
-      }
-
-      if (cd.columnType.get_type() == SQLTypes::kDECIMAL) {
-        if (cd.columnType.get_precision() == 0 && cd.columnType.get_scale() == 0) {
-          cd.columnType.set_precision(14);
-          cd.columnType.set_scale(7);
-        }
-      }
-
-      std::string col_stmt;
-      col_stmt.append(cd.columnName + " " + cd.columnType.get_type_name() + " ");
-
-      if (cd.columnType.get_compression() != EncodingType::kENCODING_NONE) {
-        col_stmt.append("ENCODING " + cd.columnType.get_compression_name() + " ");
-      } else {
-        if (cd.columnType.is_string()) {
-          col_stmt.append("ENCODING NONE");
-        } else if (cd.columnType.is_geometry()) {
-          if (cd.columnType.get_output_srid() == 4326) {
-            col_stmt.append("ENCODING NONE");
-          }
-        }
-      }
-      col_stmts.push_back(col_stmt);
-    }
-
-    stmt.append(" (" + boost::algorithm::join(col_stmts, ",") + ");");
-    runDDLStatement(stmt);
-
-    LOG(INFO) << "Created table: " << table_name;
-  } else {
-    LOG(INFO) << "Not creating table: " << table_name;
-  }
-
-  const auto td = cat.getMetadataForTable(table_name);
-  if (td == nullptr) {
-    throw std::runtime_error("Error: Failed to create table " + table_name);
-  }
-
-  Importer_NS::Importer importer(cat, td, file_path, copy_params);
-  auto ms = measure<>::execution([&]() { importer.importGDAL(colname_to_src); });
-  LOG(INFO) << "Import Time for " << table_name << ": " << (double)ms / 1000.0 << " s";
+  return import_buffers;
 }
 
 }  // namespace Importer_NS

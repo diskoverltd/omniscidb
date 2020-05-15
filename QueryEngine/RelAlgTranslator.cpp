@@ -307,7 +307,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateLiteral(
         Analyzer::ExpressionPtrVector args;
         // defaulting to valid sub-type for convenience
         target_ti.set_subtype(kBOOLEAN);
-        return makeExpr<Analyzer::ArrayExpr>(target_ti, args, -1, true);
+        return makeExpr<Analyzer::ArrayExpr>(target_ti, args, true);
       }
       return makeExpr<Analyzer::Constant>(rex_literal->getTargetType(), true, Datum{0});
     }
@@ -326,14 +326,17 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateScalarSubquery(
   CHECK(rex_subquery);
   auto result = rex_subquery->getExecutionResult();
   auto row_set = result->getRows();
-  if (row_set->rowCount() > size_t(1)) {
+  const size_t row_count = row_set->rowCount();
+  if (row_count > size_t(1)) {
     throw std::runtime_error("Scalar sub-query returned multiple rows");
   }
-  if (row_set->rowCount() < size_t(1)) {
-    CHECK_EQ(row_set->rowCount(), size_t(0));
+  if (row_count == size_t(0)) {
     throw std::runtime_error("Scalar sub-query returned no results");
   }
+  CHECK_EQ(row_count, size_t(1));
+  row_set->moveToBegin();
   auto first_row = row_set->getNextRow(false, false);
+  CHECK_EQ(first_row.size(), size_t(1));
   auto scalar_tv = boost::get<ScalarTargetValue>(&first_row[0]);
   auto ti = rex_subquery->getType();
   if (ti.is_string()) {
@@ -349,7 +352,8 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateInput(
     const RexInput* rex_input) const {
   const auto source = rex_input->getSourceNode();
   const auto it_rte_idx = input_to_nest_level_.find(source);
-  CHECK(it_rte_idx != input_to_nest_level_.end());
+  CHECK(it_rte_idx != input_to_nest_level_.end())
+      << "Not found in input_to_nest_level_, source=" << source->toString();
   const int rte_idx = it_rte_idx->second;
   const auto scan_source = dynamic_cast<const RelScan*>(source);
   const auto& in_metainfo = source->getOutputMetainfo();
@@ -378,7 +382,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateInput(
     return std::make_shared<Analyzer::ColumnVar>(
         col_ti, table_desc->tableId, cd->columnId, rte_idx);
   }
-  CHECK(!in_metainfo.empty());
+  CHECK(!in_metainfo.empty()) << "for " << source->toString();
   CHECK_GE(rte_idx, 0);
   const size_t col_id = rex_input->getIndex();
   CHECK_LT(col_id, in_metainfo.size());
@@ -1326,62 +1330,49 @@ Analyzer::ExpressionPtr RelAlgTranslator::translateArrayFunction(
     // FIX-ME:  Deal with NULL arrays
     auto translated_function_args(translateFunctionArgs(rex_function));
     if (translated_function_args.size() > 0) {
-      auto const& first_element_logical_type(
-          get_nullable_logical_type_info(translated_function_args[0]->get_type_info()));
+      const auto first_element_logical_type =
+          get_nullable_logical_type_info(translated_function_args[0]->get_type_info());
 
-      on_member_of_typeset<kCHAR, kVARCHAR, kTEXT>(
-          first_element_logical_type,
-          [&] {
-            bool same_type_status = true;
-            for (auto const& expr_ptr : translated_function_args) {
-              same_type_status =
-                  same_type_status && (expr_ptr->get_type_info().is_string());
-            }
+      auto diff_elem_itr =
+          std::find_if(translated_function_args.begin(),
+                       translated_function_args.end(),
+                       [first_element_logical_type](const auto expr) {
+                         return first_element_logical_type !=
+                                get_nullable_logical_type_info(expr->get_type_info());
+                       });
+      if (diff_elem_itr != translated_function_args.end()) {
+        throw std::runtime_error(
+            "Element " +
+            std::to_string(diff_elem_itr - translated_function_args.begin()) +
+            " is not of the same type as other elements of the array. Consider casting "
+            "to force this condition.\nElement Type: " +
+            get_nullable_logical_type_info((*diff_elem_itr)->get_type_info())
+                .to_string() +
+            "\nArray type: " + first_element_logical_type.to_string());
+      }
 
-            if (same_type_status == false) {
-              throw std::runtime_error(
-                  "All elements of the array are not of the same logical subtype; "
-                  "consider casting to force this condition.");
-            }
+      if (first_element_logical_type.is_string() &&
+          !first_element_logical_type.is_dict_encoded_string()) {
+        sql_type.set_subtype(first_element_logical_type.get_type());
+        sql_type.set_compression(kENCODING_FIXED);
+      } else if (first_element_logical_type.is_dict_encoded_string()) {
+        sql_type.set_subtype(first_element_logical_type.get_type());
+        sql_type.set_comp_param(TRANSIENT_DICT_ID);
+      } else {
+        sql_type.set_subtype(first_element_logical_type.get_type());
+        sql_type.set_scale(first_element_logical_type.get_scale());
+        sql_type.set_precision(first_element_logical_type.get_precision());
+      }
 
-            sql_type.set_subtype(first_element_logical_type.get_type());
-            sql_type.set_compression(kENCODING_FIXED);
-            sql_type.set_comp_param(TRANSIENT_DICT_ID);
-          },
-          [&] {
-            // Non string types
-            bool same_type_status = true;
-            for (auto const& expr_ptr : translated_function_args) {
-              same_type_status =
-                  same_type_status &&
-                  (first_element_logical_type ==
-                   get_nullable_logical_type_info(expr_ptr->get_type_info()));
-            }
-
-            if (same_type_status == false) {
-              throw std::runtime_error(
-                  "All elements of the array are not of the same logical subtype; "
-                  "consider casting to force this condition.");
-            }
-            sql_type.set_subtype(first_element_logical_type.get_type());
-            sql_type.set_scale(first_element_logical_type.get_scale());
-            sql_type.set_precision(first_element_logical_type.get_precision());
-          });
-
-      feature_stash_.setCPUOnlyExecutionRequired();
-      return makeExpr<Analyzer::ArrayExpr>(
-          sql_type, translated_function_args, feature_stash_.getAndBumpArrayExprCount());
+      return makeExpr<Analyzer::ArrayExpr>(sql_type, translated_function_args);
     } else {
       // defaulting to valid sub-type for convenience
       sql_type.set_subtype(kBOOLEAN);
-      return makeExpr<Analyzer::ArrayExpr>(
-          sql_type, translated_function_args, feature_stash_.getAndBumpArrayExprCount());
+      return makeExpr<Analyzer::ArrayExpr>(sql_type, translated_function_args);
     }
   } else {
-    feature_stash_.setCPUOnlyExecutionRequired();
     return makeExpr<Analyzer::ArrayExpr>(rex_function->getType(),
-                                         translateFunctionArgs(rex_function),
-                                         feature_stash_.getAndBumpArrayExprCount());
+                                         translateFunctionArgs(rex_function));
   }
 }
 
@@ -1538,6 +1529,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
                    "ST_Intersects"sv,
                    "ST_Disjoint"sv,
                    "ST_Contains"sv,
+                   "ST_Overlaps"sv,
                    "ST_Within"sv)) {
     CHECK_EQ(rex_function->size(), size_t(2));
     return translateBinaryGeoFunction(rex_function);
@@ -1586,6 +1578,16 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
     }
   }
   ret_ti.set_notnull(arguments_not_null);
+
+  // set encoding of certain Extension Function return values
+  if (func_resolve(rex_function->getName(),
+                   "reg_hex_horiz_pixel_bin_packed"sv,
+                   "reg_hex_vert_pixel_bin_packed"sv,
+                   "rect_pixel_bin_packed"sv)) {
+    CHECK(ret_ti.get_type() == kINT);
+    ret_ti.set_compression(kENCODING_PACKED_PIXEL_COORD);
+  }
+
   return makeExpr<Analyzer::FunctionOper>(ret_ti, rex_function->getName(), arg_expr_list);
 }
 

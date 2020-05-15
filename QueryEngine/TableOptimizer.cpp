@@ -107,7 +107,7 @@ inline CompilationOptions get_compilation_options(const ExecutorDeviceType& devi
 
 inline ExecutionOptions get_execution_options() {
   return ExecutionOptions{
-      false, false, false, false, false, false, false, false, 0, false, false, 0};
+      false, false, false, false, false, false, false, false, 0, false, false, 0, false};
 }
 
 }  // namespace
@@ -183,8 +183,8 @@ void TableOptimizer::recomputeMetadata() const {
 
             const auto& ti = cd->columnType;
 
-            ChunkMetadata chunk_metadata;
-            chunk_metadata.sqlType = get_logical_type_info(ti);
+            auto chunk_metadata = std::make_shared<ChunkMetadata>();
+            chunk_metadata->sqlType = get_logical_type_info(ti);
 
             const auto count_val = read_scalar_target_value<int64_t>(row[0]);
             if (count_val == 0) {
@@ -221,21 +221,21 @@ void TableOptimizer::recomputeMetadata() const {
             }
 
             // place manufacture min and max in fake row to use common infra
-            if (!set_metadata_from_results(chunk_metadata, fakerow, ti, false)) {
+            if (!set_metadata_from_results(*chunk_metadata, fakerow, ti, false)) {
               LOG(WARNING) << "Unable to process new metadata values for column "
                            << cd->columnName;
               return;
             }
 
             stats_map.emplace(
-                std::make_pair(fragment_info.fragmentId, chunk_metadata.chunkStats));
+                std::make_pair(fragment_info.fragmentId, chunk_metadata->chunkStats));
             tuple_count_map.emplace(std::make_pair(fragment_info.fragmentId, num_tuples));
           };
 
       executor_->executeWorkUnitPerFragment(
           ra_exe_unit, table_infos[0], co, eo, cat_, compute_deleted_callback);
 
-      auto* fragmenter = td->fragmenter;
+      auto* fragmenter = td->fragmenter.get();
       CHECK(fragmenter);
       fragmenter->updateChunkStats(cd, stats_map);
       fragmenter->setNumRows(total_num_tuples);
@@ -295,8 +295,8 @@ void TableOptimizer::recomputeMetadata() const {
 
             const auto& ti = cd->columnType;
 
-            ChunkMetadata chunk_metadata;
-            chunk_metadata.sqlType = get_logical_type_info(ti);
+            auto chunk_metadata = std::make_shared<ChunkMetadata>();
+            chunk_metadata->sqlType = get_logical_type_info(ti);
 
             const auto count_val = read_scalar_target_value<int64_t>(row[2]);
             if (count_val == 0) {
@@ -314,20 +314,20 @@ void TableOptimizer::recomputeMetadata() const {
                             fragment_info.getPhysicalNumTuples());
             }
 
-            if (!set_metadata_from_results(chunk_metadata, row, ti, has_nulls)) {
+            if (!set_metadata_from_results(*chunk_metadata, row, ti, has_nulls)) {
               LOG(WARNING) << "Unable to process new metadata values for column "
                            << cd->columnName;
               return;
             }
 
             stats_map.emplace(
-                std::make_pair(fragment_info.fragmentId, chunk_metadata.chunkStats));
+                std::make_pair(fragment_info.fragmentId, chunk_metadata->chunkStats));
           };
 
       executor_->executeWorkUnitPerFragment(
           ra_exe_unit, table_infos[0], co, eo, cat_, compute_metadata_callback);
 
-      auto* fragmenter = td->fragmenter;
+      auto* fragmenter = td->fragmenter.get();
       CHECK(fragmenter);
       fragmenter->updateChunkStats(cd, stats_map);
     }

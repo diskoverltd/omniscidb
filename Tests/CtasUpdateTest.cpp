@@ -26,8 +26,6 @@
 #include "../Shared/file_delete.h"
 #include "TestHelpers.h"
 
-#include "../Shared/ConfigResolve.h"
-
 // uncomment to run full test suite
 // #define RUN_ALL_TEST
 
@@ -839,7 +837,8 @@ TEST(Ctas, CreateTableAsSelect_IfNotExists) {
 void runCtasTest(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
                  std::string create_ctas_sql,
                  int num_rows,
-                 int num_rows_to_check) {
+                 int num_rows_to_check,
+                 std::string sourcePartitionScheme = ")") {
   run_ddl_statement("DROP TABLE IF EXISTS CTAS_SOURCE;");
   run_ddl_statement("DROP TABLE IF EXISTS CTAS_TARGET;");
 
@@ -853,7 +852,7 @@ void runCtasTest(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescr
 
     create_sql += ", col_" + std::to_string(col) + " " + tcd->get_column_definition();
   }
-  create_sql += ");";
+  create_sql += sourcePartitionScheme + ";";
 
   LOG(INFO) << create_sql;
 
@@ -946,7 +945,44 @@ TEST_P(Ctas, CreateTableAsSelect) {
   std::string create_ctas_sql = "CREATE TABLE CTAS_TARGET AS SELECT * FROM CTAS_SOURCE;";
   int num_rows = 25;
   int num_rows_to_check = num_rows;
-  runCtasTest(columnDescriptors, create_ctas_sql, num_rows, num_rows_to_check);
+  runCtasTest(columnDescriptors, create_ctas_sql, num_rows, num_rows_to_check, ")");
+}
+
+TEST_P(Ctas, CreateTableFromSelectFragments) {
+  // execute CTAS
+  std::string create_ctas_sql = "CREATE TABLE CTAS_TARGET AS SELECT * FROM CTAS_SOURCE;";
+  int num_rows = 25;
+  int num_rows_to_check = num_rows;
+  runCtasTest(columnDescriptors,
+              create_ctas_sql,
+              num_rows,
+              num_rows_to_check,
+              ") WITH (FRAGMENT_SIZE=3)");
+}
+
+TEST_P(Ctas, CreateTableFromSelectReplicated) {
+  // execute CTAS
+  std::string create_ctas_sql = "CREATE TABLE CTAS_TARGET AS SELECT * FROM CTAS_SOURCE;";
+  int num_rows = 25;
+  int num_rows_to_check = num_rows;
+  runCtasTest(columnDescriptors,
+              create_ctas_sql,
+              num_rows,
+              num_rows_to_check,
+              ") WITH (FRAGMENT_SIZE=3, partitions='REPLICATED')");
+}
+
+TEST_P(Ctas, CreateTableFromSelectSharded) {
+  // execute CTAS
+  std::string create_ctas_sql = "CREATE TABLE CTAS_TARGET AS SELECT * FROM CTAS_SOURCE;";
+  int num_rows = 25;
+  int num_rows_to_check = num_rows;
+  runCtasTest(
+      columnDescriptors,
+      create_ctas_sql,
+      num_rows,
+      num_rows_to_check,
+      ", SHARD KEY (id)) WITH (FRAGMENT_SIZE=3, shard_count = 4, partitions='SHARDED')");
 }
 
 TEST_P(Ctas, CreateTableAsSelectWithLimit) {
@@ -1113,13 +1149,37 @@ TEST(Itas, DifferentColumnNames) {
   check(30, 3);
 }
 
+TEST(Itas, SelectStar) {
+  run_ddl_statement("DROP TABLE IF EXISTS ITAS_SOURCE_1;");
+  run_ddl_statement("DROP TABLE IF EXISTS ITAS_SOURCE_2;");
+  run_ddl_statement("DROP TABLE IF EXISTS ITAS_TARGET;");
+
+  run_ddl_statement("CREATE TABLE ITAS_SOURCE_1 (id int);");
+  run_ddl_statement("CREATE TABLE ITAS_SOURCE_2 (id int, val int);");
+  run_ddl_statement("CREATE TABLE ITAS_TARGET (id int, val int);");
+
+  run_multiple_agg("INSERT INTO ITAS_SOURCE_1 VALUES(1); ", ExecutorDeviceType::CPU);
+  run_multiple_agg("INSERT INTO ITAS_SOURCE_2 VALUES(1, 2); ", ExecutorDeviceType::CPU);
+
+  EXPECT_NO_THROW(run_ddl_statement(
+      "INSERT INTO ITAS_TARGET SELECT ITAS_SOURCE_1.*, ITAS_SOURCE_2.val FROM "
+      "ITAS_SOURCE_1 JOIN ITAS_SOURCE_2 on ITAS_SOURCE_1.id = ITAS_SOURCE_2.id;"));
+
+  run_ddl_statement("DROP TABLE ITAS_SOURCE_1;");
+  run_ddl_statement("DROP TABLE ITAS_SOURCE_2;");
+  run_ddl_statement("DROP TABLE ITAS_TARGET;");
+}
+
 void itasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
-                  std::string targetPartitionScheme = ")") {
+                  std::string sourcePartitionScheme = ")",
+                  std::string targetPartitionScheme = ")",
+                  std::string targetTempTable = "") {
   run_ddl_statement("DROP TABLE IF EXISTS ITAS_SOURCE;");
   run_ddl_statement("DROP TABLE IF EXISTS ITAS_TARGET;");
 
   std::string create_source_sql = "CREATE TABLE ITAS_SOURCE (id int";
-  std::string create_target_sql = "CREATE TABLE ITAS_TARGET (id int";
+  std::string create_target_sql =
+      "CREATE " + targetTempTable + " TABLE ITAS_TARGET (id int";
   for (unsigned int col = 0; col < columnDescriptors.size(); col++) {
     auto tcd = columnDescriptors[col];
     if (tcd->skip_test("CreateTableAsSelect")) {
@@ -1132,7 +1192,7 @@ void itasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDesc
     create_target_sql +=
         ", col_" + std::to_string(col) + " " + tcd->get_column_definition();
   }
-  create_source_sql += ");";
+  create_source_sql += sourcePartitionScheme + ";";
   create_target_sql += targetPartitionScheme + ";";
 
   LOG(INFO) << create_source_sql;
@@ -1196,16 +1256,137 @@ void itasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDesc
 }
 
 TEST_P(Itas, InsertIntoTableFromSelect) {
-  itasTestBody(columnDescriptors, ")");
+  itasTestBody(columnDescriptors, ")", ")");
+}
+
+TEST_P(Itas, InsertIntoTableFromSelectFragments) {
+  itasTestBody(columnDescriptors, ") WITH (FRAGMENT_SIZE=3)", ")");
+}
+
+TEST_P(Itas, InsertIntoFragmentsTableFromSelect) {
+  itasTestBody(columnDescriptors, ")", ") WITH (FRAGMENT_SIZE=3)");
+}
+
+TEST_P(Itas, InsertIntoFragmentsTableFromSelectFragments) {
+  itasTestBody(columnDescriptors, ") WITH (FRAGMENT_SIZE=3)", ") WITH (FRAGMENT_SIZE=3)");
 }
 
 TEST_P(Itas, InsertIntoTableFromSelectReplicated) {
-  itasTestBody(columnDescriptors, ") WITH (partitions='REPLICATED')");
+  itasTestBody(
+      columnDescriptors, ") WITH (FRAGMENT_SIZE=3, partitions='REPLICATED')", ")");
 }
 
 TEST_P(Itas, InsertIntoTableFromSelectSharded) {
+  itasTestBody(
+      columnDescriptors,
+      ", SHARD KEY (id)) WITH (FRAGMENT_SIZE=3, shard_count = 4, partitions='SHARDED')",
+      ")");
+}
+
+TEST_P(Itas, InsertIntoReplicatedTableFromSelect) {
+  itasTestBody(columnDescriptors, ")", ") WITH (partitions='REPLICATED')");
+}
+
+TEST_P(Itas, InsertIntoShardedTableFromSelect) {
   itasTestBody(columnDescriptors,
+               ")",
                ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')");
+}
+
+TEST_P(Itas, InsertIntoReplicatedTableFromSelectReplicated) {
+  itasTestBody(columnDescriptors,
+               ") WITH (partitions='REPLICATED')",
+               ") WITH (partitions='REPLICATED')");
+}
+
+TEST_P(Itas, InsertIntoReplicatedTableFromSelectSharded) {
+  itasTestBody(columnDescriptors,
+               ") WITH (partitions='REPLICATED')",
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')");
+}
+
+TEST_P(Itas, InsertIntoShardedTableFromSelectSharded) {
+  itasTestBody(columnDescriptors,
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')",
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')");
+}
+
+TEST_P(Itas, InsertIntoShardedTableFromSelectReplicated) {
+  itasTestBody(columnDescriptors,
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')",
+               ") WITH (partitions='REPLICATED')");
+}
+
+void exportTestBody(std::string sourcePartitionScheme = ")") {
+  run_ddl_statement("DROP TABLE IF EXISTS EXPORT_SOURCE;");
+
+  std::string create_sql =
+      "CREATE TABLE EXPORT_SOURCE ( id int, val int " + sourcePartitionScheme + ";";
+  LOG(INFO) << create_sql;
+
+  run_ddl_statement(create_sql);
+
+  size_t num_rows = 25;
+  std::vector<std::string> expected_rows;
+
+  // fill source table
+  for (unsigned int row = 0; row < num_rows; row++) {
+    std::string insert_sql = "INSERT INTO EXPORT_SOURCE VALUES (" + std::to_string(row) +
+                             "," + std::to_string(row) + ");";
+    expected_rows.push_back(std::to_string(row) + "," + std::to_string(row));
+
+    run_multiple_agg(insert_sql, ExecutorDeviceType::CPU);
+  }
+
+  boost::filesystem::path temp =
+      boost::filesystem::temp_directory_path() / boost::filesystem::unique_path();
+
+  std::string export_file_name = temp.native();
+
+  // execute CTAS
+  std::string export_sql = "COPY (SELECT * FROM EXPORT_SOURCE) TO '" + export_file_name +
+                           "' with (header='false', quoted='false');";
+  LOG(INFO) << export_sql;
+
+  run_ddl_statement(export_sql);
+
+  std::ifstream export_file(export_file_name);
+
+  std::vector<std::string> exported_rows;
+
+  std::copy(std::istream_iterator<std::string>(export_file),
+            std::istream_iterator<std::string>(),
+            std::back_inserter(exported_rows));
+
+  export_file.close();
+  remove(export_file_name.c_str());
+
+  std::sort(exported_rows.begin(), exported_rows.end());
+  std::sort(expected_rows.begin(), expected_rows.end());
+
+  ASSERT_EQ(expected_rows.size(), num_rows);
+  ASSERT_EQ(exported_rows.size(), num_rows);
+
+  for (unsigned int row = 0; row < num_rows; row++) {
+    ASSERT_EQ(exported_rows[row], expected_rows[row]);
+  }
+}
+
+TEST(Export, ExportFromSelect) {
+  exportTestBody(")");
+}
+
+TEST(Export, ExportFromSelectFragments) {
+  exportTestBody(") WITH (FRAGMENT_SIZE=3)");
+}
+
+TEST(Export, ExportFromSelectReplicated) {
+  exportTestBody(") WITH (FRAGMENT_SIZE=3, partitions='REPLICATED')");
+}
+
+TEST(Export, ExportFromSelectSharded) {
+  exportTestBody(
+      ", SHARD KEY (id)) WITH (FRAGMENT_SIZE=3, shard_count = 4, partitions='SHARDED')");
 }
 
 TEST(Update, InvalidTextArrayAssignment) {
@@ -1233,12 +1414,6 @@ TEST(Update, InvalidTextArrayAssignment) {
 }
 
 TEST_P(Update, UpdateColumnByColumn) {
-  // disable if varlen update is not enabled
-  if (!is_feature_enabled<VarlenUpdates>()) {
-    LOG(WARNING) << "skipping...";
-    return;
-  }
-
   run_ddl_statement("DROP TABLE IF EXISTS update_test;");
 
   std::string create_sql = "CREATE TABLE update_test(id int";
@@ -1323,12 +1498,6 @@ TEST_P(Update, UpdateColumnByColumn) {
 void updateColumnByLiteralTest(
     std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
     size_t numColsToUpdate) {
-  // disable if varlen update is not enabled
-  if (!is_feature_enabled<VarlenUpdates>()) {
-    LOG(WARNING) << "skipping...";
-    return;
-  }
-
   run_ddl_statement("DROP TABLE IF EXISTS update_test;");
 
   std::string create_sql = "CREATE TABLE update_test(id int";
@@ -1690,6 +1859,23 @@ INSTANTIATE_TEST_SUITE_P(
         TIMESTAMP_FIXED_LEN_ARRAY
 
     }));
+
+TEST(Itas, InsertIntoTempTableFromSelect) {
+  std::vector<std::shared_ptr<TestColumnDescriptor>> columnDescriptors = {
+      BOOLEAN,
+      TINYINT,
+      SMALLINT,
+      INTEGER,
+      BIGINT,
+      NUMERIC,
+      TEXT,
+      TIME,
+      DATE,
+      TIMESTAMP,
+  };
+
+  itasTestBody(columnDescriptors, ")", ")", "TEMPORARY");
+}
 
 int main(int argc, char* argv[]) {
   testing::InitGoogleTest(&argc, argv);

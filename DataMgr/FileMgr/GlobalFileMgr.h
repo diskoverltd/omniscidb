@@ -53,9 +53,6 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
                 const size_t num_reader_threads = 0,
                 const size_t defaultPageSize = 2097152);
 
-  /// Destructor
-  ~GlobalFileMgr() override;
-
   /// Creates a chunk with the specified key and page size.
   AbstractBuffer* createBuffer(const ChunkKey& key,
                                size_t pageSize = 0,
@@ -121,11 +118,9 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
   void init();
 
-  void getChunkMetadataVec(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec) override;
-  void getChunkMetadataVecForKeyPrefix(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec,
-      const ChunkKey& keyPrefix) override {
+  void getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec) override;
+  void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
+                                       const ChunkKey& keyPrefix) override {
     return getFileMgr(keyPrefix)->getChunkMetadataVecForKeyPrefix(chunkMetadataVec,
                                                                   keyPrefix);
   }
@@ -145,9 +140,11 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
   size_t getNumChunks() override;
 
-  AbstractBufferMgr* findFileMgr(const int db_id,
-                                 const int tb_id,
-                                 const bool remove_from_map = false);
+ private:
+  AbstractBufferMgr* findFileMgr(const int db_id, const int tb_id);
+  void deleteFileMgr(const int db_id, const int tb_id);
+
+ public:
   AbstractBufferMgr* getFileMgr(const int db_id, const int tb_id);
   AbstractBufferMgr* getFileMgr(const ChunkKey& key) {
     return getFileMgr(key[0], key[1]);
@@ -162,7 +159,7 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
   inline bool getDBConvert() const { return dbConvert_; }
   inline void setDBConvert(bool val) { dbConvert_ = val; }
 
-  void removeTableRelatedDS(const int db_id, const int tb_id);
+  void removeTableRelatedDS(const int db_id, const int tb_id) override;
   void setTableEpoch(const int db_id, const int tb_id, const int start_epoch);
   size_t getTableEpoch(const int db_id, const int tb_id);
 
@@ -184,7 +181,9 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
    */
   bool dbConvert_;  /// true if conversion should be done between different
                     /// "mapd_db_version_"
-  std::map<std::pair<int, int>, AbstractBufferMgr*> fileMgrs_;
+
+  std::map<std::pair<int, int>, std::shared_ptr<AbstractBufferMgr>> ownedFileMgrs_;
+  std::map<std::pair<int, int>, AbstractBufferMgr*> allFileMgrs_;
 
   mapd_shared_mutex fileMgrs_mutex_;
 };

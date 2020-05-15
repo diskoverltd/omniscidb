@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <llvm/Support/Program.h>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <csignal>
@@ -31,7 +32,6 @@
 #include "QueryEngine/UDFCompiler.h"
 #include "QueryRunner/QueryRunner.h"
 #include "Shared/Logger.h"
-#include "Shared/MapDParameters.h"
 #include "TestHelpers.h"
 
 #ifndef BASE_PATH
@@ -103,6 +103,18 @@ inline void run_ddl_statement(const std::string& query) {
   QR::get()->runDDLStatement(query);
 }
 
+CudaMgr_Namespace::NvidiaDeviceArch init_nvidia_device_arch() {
+#ifdef HAVE_CUDA
+  auto cuda_mgr = std::make_unique<CudaMgr_Namespace::CudaMgr>(/*num_gpus=*/0);
+  CHECK(cuda_mgr);
+  return cuda_mgr->getDeviceArch();
+#else
+  return CudaMgr_Namespace::NvidiaDeviceArch::Kepler;
+#endif
+}
+
+CudaMgr_Namespace::NvidiaDeviceArch g_device_arch = init_nvidia_device_arch();
+
 class SQLTestEnv : public ::testing::Environment {
  public:
   void SetUp() override {
@@ -111,7 +123,9 @@ class SQLTestEnv : public ::testing::Environment {
       throw std::runtime_error("udf file: " + udf_file.string() + " does not exist");
     }
 
-    UdfCompiler compiler(udf_file.string());
+    std::vector<std::string> udf_compiler_options{std::string("-D UDF_COMPILER_OPTION")};
+    UdfCompiler compiler(
+        udf_file.string(), g_device_arch, std::string(""), udf_compiler_options);
     auto compile_result = compiler.compileUdf();
     EXPECT_EQ(compile_result, 0);
 
@@ -168,7 +182,7 @@ class UDFCompilerTest : public ::testing::Test {
 };
 
 TEST_F(UDFCompilerTest, CompileTest) {
-  UdfCompiler compiler(getUdfFileName());
+  UdfCompiler compiler(getUdfFileName(), g_device_arch);
   auto compile_result = compiler.compileUdf();
 
   EXPECT_EQ(compile_result, 0);
@@ -176,8 +190,31 @@ TEST_F(UDFCompilerTest, CompileTest) {
   // LOG(FATAL) which stops the process and does not return
 }
 
+TEST_F(UDFCompilerTest, CompilerOptionTest) {
+  UdfCompiler compiler(getUdfFileName(), g_device_arch);
+  auto compile_result = compiler.compileUdf();
+
+  EXPECT_EQ(compile_result, 0);
+
+  // This function signature is only visible via the -DUDF_COMPILER_OPTION
+  // definition. This definition was passed to the UdfCompiler is Setup.
+  // We had to do it there because Calcite only reads the ast definitions once
+  // at startup
+
+  auto signature = ExtensionFunctionsWhitelist::get_udf("udf_range_int2");
+  ASSERT_NE(signature, nullptr);
+}
+
+TEST_F(UDFCompilerTest, CompilerPathTest) {
+  UdfCompiler compiler(
+      getUdfFileName(), g_device_arch, llvm::sys::findProgramByName("clang++").get());
+  auto compile_result = compiler.compileUdf();
+
+  EXPECT_EQ(compile_result, 0);
+}
+
 TEST_F(UDFCompilerTest, CalciteRegistration) {
-  UdfCompiler compiler(getUdfFileName());
+  UdfCompiler compiler(getUdfFileName(), g_device_arch);
   auto compile_result = compiler.compileUdf();
 
   ASSERT_EQ(compile_result, 0);
@@ -204,7 +241,7 @@ TEST_F(UDFCompilerTest, CalciteRegistration) {
 }
 
 TEST_F(UDFCompilerTest, UdfQuery) {
-  UdfCompiler compiler(getUdfFileName());
+  UdfCompiler compiler(getUdfFileName(), g_device_arch);
   auto compile_result = compiler.compileUdf();
 
   ASSERT_EQ(compile_result, 0);

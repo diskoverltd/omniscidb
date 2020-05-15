@@ -24,12 +24,11 @@
 #include <boost/core/noncopyable.hpp>
 
 #include "Catalog/Catalog.h"
-#include "Shared/ConfigResolve.h"
-#include "Shared/sql_window_function_to_string.h"
-
 #include "QueryEngine/Rendering/RenderInfo.h"
 #include "QueryEngine/TargetMetaInfo.h"
 #include "QueryEngine/TypePunning.h"
+#include "Shared/sql_window_function_to_string.h"
+#include "Utils/FsiUtils.h"
 
 using ColumnNameList = std::vector<std::string>;
 
@@ -250,6 +249,7 @@ class RexOperator : public RexScalar {
 };
 
 class RelAlgNode;
+using RelAlgInputs = std::vector<std::shared_ptr<const RelAlgNode>>;
 
 class ExecutionResult;
 
@@ -604,7 +604,11 @@ class RexAgg : public Rex {
 
 class RelAlgNode {
  public:
-  RelAlgNode() : id_(crt_id_++), context_data_(nullptr), is_nop_(false) {}
+  RelAlgNode(RelAlgInputs inputs = {})
+      : inputs_(std::move(inputs))
+      , id_(crt_id_++)
+      , context_data_(nullptr)
+      , is_nop_(false) {}
 
   virtual ~RelAlgNode() {}
 
@@ -638,12 +642,12 @@ class RelAlgNode {
   const size_t inputCount() const { return inputs_.size(); }
 
   const RelAlgNode* getInput(const size_t idx) const {
-    CHECK(idx < inputs_.size());
+    CHECK_LT(idx, inputs_.size());
     return inputs_[idx].get();
   }
 
   std::shared_ptr<const RelAlgNode> getAndOwnInput(const size_t idx) const {
-    CHECK(idx < inputs_.size());
+    CHECK_LT(idx, inputs_.size());
     return inputs_[idx];
   }
 
@@ -683,7 +687,7 @@ class RelAlgNode {
   static void resetRelAlgFirstId() noexcept;
 
  protected:
-  std::vector<std::shared_ptr<const RelAlgNode>> inputs_;
+  RelAlgInputs inputs_;
   const unsigned id_;
 
  private:
@@ -749,7 +753,6 @@ class ModifyManipulationTarget {
   auto const isDeleteViaSelect() const { return is_delete_via_select_; }
   auto const isVarlenUpdateRequired() const { return varlen_update_required_; }
 
-  int getTargetColumnCount() const { return target_columns_.size(); }
   void setTargetColumns(ColumnNameList const& target_columns) const {
     target_columns_ = target_columns;
   }
@@ -831,7 +834,14 @@ class RelProject : public RelAlgNode, public ModifyManipulationTarget {
   const std::string getFieldName(const size_t i) const { return fields_[i]; }
 
   void replaceInput(std::shared_ptr<const RelAlgNode> old_input,
-                    std::shared_ptr<const RelAlgNode> input) override;
+                    std::shared_ptr<const RelAlgNode> input) override {
+    replaceInput(old_input, input, std::nullopt);
+  }
+
+  void replaceInput(
+      std::shared_ptr<const RelAlgNode> old_input,
+      std::shared_ptr<const RelAlgNode> input,
+      std::optional<std::unordered_map<unsigned, unsigned>> old_to_new_index_map);
 
   void appendInput(std::string new_field_name,
                    std::unique_ptr<const RexScalar> new_input);
@@ -846,6 +856,8 @@ class RelProject : public RelAlgNode, public ModifyManipulationTarget {
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override;
+
+  bool hasWindowFunctionExpr() const;
 
  private:
   template <typename EXPR_VISITOR_FUNCTOR>
@@ -920,7 +932,7 @@ class RelAggregate : public RelAlgNode {
     for (const auto& agg_expr : agg_exprs_) {
       result += " " + agg_expr->toString();
     }
-    return result + " ])";
+    return result + " ]))";
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override;
@@ -961,7 +973,7 @@ class RelJoin : public RelAlgNode {
         "(RelJoin<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
     result += condition_ ? condition_->toString() : "null";
     result += " " + std::to_string(static_cast<int>(join_type_));
-    return result + ")";
+    return result + "))";
   }
 
   size_t size() const override { return inputs_[0]->size() + inputs_[1]->size(); }
@@ -1000,7 +1012,7 @@ class RelFilter : public RelAlgNode {
     std::string result =
         "(RelFilter<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
     result += filter_ ? filter_->toString() : "null";
-    return result + ")";
+    return result + "))";
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override;
@@ -1013,7 +1025,7 @@ class RelFilter : public RelAlgNode {
 class RelLeftDeepInnerJoin : public RelAlgNode {
  public:
   RelLeftDeepInnerJoin(const std::shared_ptr<RelFilter>& filter,
-                       std::vector<std::shared_ptr<const RelAlgNode>> inputs,
+                       RelAlgInputs inputs,
                        std::vector<std::shared_ptr<const RelJoin>>& original_joins);
 
   const RexScalar* getInnerCondition() const;
@@ -1120,7 +1132,7 @@ class RelCompound : public RelAlgNode, public ModifyManipulationTarget {
     for (const auto& scalar_source : scalar_sources_) {
       result += " " + scalar_source->toString();
     }
-    return result + " ])";
+    return result + " ]))";
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override;
@@ -1182,7 +1194,7 @@ class RelSort : public RelAlgNode {
       result += sort_field.toString() + " ";
     }
     result += "]";
-    return result + ")";
+    return result + "))";
   }
 
   size_t size() const override { return inputs_[0]->size(); }
@@ -1242,6 +1254,7 @@ class RelModify : public RelAlgNode {
       , flattened_(flattened)
       , operation_(yieldModifyOperationEnum(op_string))
       , target_column_list_(target_column_list) {
+    foreign_storage::validate_non_foreign_table_write(table_descriptor_);
     inputs_.push_back(input);
   }
 
@@ -1256,6 +1269,7 @@ class RelModify : public RelAlgNode {
       , flattened_(flattened)
       , operation_(op)
       , target_column_list_(target_column_list) {
+    foreign_storage::validate_non_foreign_table_write(table_descriptor_);
     inputs_.push_back(input);
   }
 
@@ -1327,19 +1341,11 @@ class RelModify : public RelAlgNode {
         }
 
         // Check for valid types
-        if (is_feature_enabled<VarlenUpdates>()) {
-          if (column_desc->columnType.is_varlen()) {
-            varlen_update_required = true;
-          }
-
-          if (column_desc->columnType.is_geometry()) {
-            throw std::runtime_error("UPDATE of a geo column is unsupported.");
-          }
-        } else {
-          if (column_desc->columnType.is_varlen()) {
-            throw std::runtime_error(
-                "UPDATE of a none-encoded string, geo, or array column is unsupported.");
-          }
+        if (column_desc->columnType.is_varlen()) {
+          varlen_update_required = true;
+        }
+        if (column_desc->columnType.is_geometry()) {
+          throw std::runtime_error("UPDATE of a geo column is unsupported.");
         }
       }
     };
@@ -1353,7 +1359,6 @@ class RelModify : public RelAlgNode {
         dynamic_cast<RelProject const*>(inputs_[0].get());
     CHECK(previous_project_node != nullptr);
     previous_project_node->setDeleteViaSelectFlag();
-    previous_project_node->injectOffsetInFragmentExpr();
     previous_project_node->setModifiedTableDescriptor(table_descriptor_);
   }
 
@@ -1426,7 +1431,7 @@ class RelTableFunction : public RelAlgNode {
         result += ", ";
       }
     }
-    result += "]";
+    result += "])";
 
     return result;
   }
@@ -1494,6 +1499,26 @@ class RelLogicalValues : public RelAlgNode {
   const std::vector<RowValues> values_;
 };
 
+class RelLogicalUnion : public RelAlgNode {
+ public:
+  RelLogicalUnion(RelAlgInputs, bool is_all);
+  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  size_t size() const override;
+  std::string toString() const override;
+
+  std::string getFieldName(const size_t i) const;
+
+  inline bool isAll() const { return is_all_; }
+  bool inputMetainfoTypesMatch() const;
+  RexScalar const* copyAndRedirectSource(RexScalar const*, size_t input_idx) const;
+
+  // Not unique_ptr to allow for an easy deepCopy() implementation.
+  mutable std::vector<std::shared_ptr<const RexScalar>> scalar_exprs_;
+
+ private:
+  bool const is_all_;
+};
+
 class QueryNotSupported : public std::runtime_error {
  public:
   QueryNotSupported(const std::string& reason) : std::runtime_error(reason) {}
@@ -1535,6 +1560,8 @@ class RelAlgDagBuilder : public boost::noncopyable {
                    const rapidjson::Value& query_ast,
                    const Catalog_Namespace::Catalog& cat,
                    const RenderInfo* render_opts);
+
+  void eachNode(std::function<void(RelAlgNode const*)> const&) const;
 
   /**
    * Returns the root node of the DAG.
@@ -1580,8 +1607,8 @@ class RelAlgDagBuilder : public boost::noncopyable {
   const RenderInfo* render_info_;
 };
 
-std::string tree_string(const RelAlgNode*, const size_t indent = 0);
-
 using RANodeOutput = std::vector<RexInput>;
 
 RANodeOutput get_node_output(const RelAlgNode* ra_node);
+
+std::string tree_string(const RelAlgNode*, const size_t depth = 0);

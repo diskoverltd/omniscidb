@@ -26,6 +26,7 @@
 #include "TypePunning.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -872,7 +873,11 @@ extern "C" GPU_RT_STUB void force_sync() {}
 
 extern "C" GPU_RT_STUB void sync_warp() {}
 extern "C" GPU_RT_STUB void sync_warp_protected(int64_t thread_pos, int64_t row_count) {}
+extern "C" GPU_RT_STUB void sync_threadblock() {}
 
+extern "C" GPU_RT_STUB void write_back_non_grouped_agg(int64_t* input_buffer,
+                                                       int64_t* output_buffer,
+                                                       const int32_t num_agg_cols){};
 // x64 stride functions
 
 extern "C" __attribute__((noinline)) int32_t pos_start_impl(int32_t* error_code) {
@@ -893,6 +898,18 @@ extern "C" __attribute__((noinline)) int32_t pos_step_impl() {
 }
 
 extern "C" GPU_RT_STUB int8_t thread_warp_idx(const int8_t warp_sz) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int64_t get_thread_index() {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int64_t* declare_dynamic_shared_memory() {
+  return nullptr;
+}
+
+extern "C" GPU_RT_STUB int64_t get_block_index() {
   return 0;
 }
 
@@ -927,44 +944,9 @@ extern "C" __attribute__((noinline)) void write_back_nop(int64_t* dest,
   assert(dest);
 }
 
-extern "C" __attribute__((noinline)) const int64_t* init_shared_mem(
-    const int64_t* groups_buffer,
-    const int32_t groups_buffer_size) {
-  return init_shared_mem_nop(groups_buffer, groups_buffer_size);
-}
-
-extern "C" __attribute__((noinline)) const int64_t* init_shared_mem_dynamic(
-    const int64_t* groups_buffer,
-    const int32_t groups_buffer_size) {
+extern "C" int64_t* init_shared_mem(const int64_t* global_groups_buffer,
+                                    const int32_t groups_buffer_size) {
   return nullptr;
-}
-
-extern "C" __attribute__((noinline)) void write_back(int64_t* dest,
-                                                     int64_t* src,
-                                                     const int32_t sz) {
-  write_back_nop(dest, src, sz);
-}
-
-extern "C" __attribute__((noinline)) void write_back_smem_nop(int64_t* dest,
-                                                              int64_t* src,
-                                                              const int32_t sz) {
-  assert(dest);
-}
-
-extern "C" __attribute__((noinline)) void agg_from_smem_to_gmem_nop(int64_t* dest,
-                                                                    int64_t* src,
-                                                                    const int32_t sz) {
-  assert(dest);
-}
-
-extern "C" __attribute__((noinline)) void
-agg_from_smem_to_gmem_count_binId(int64_t* dest, int64_t* src, const int32_t sz) {
-  return agg_from_smem_to_gmem_nop(dest, src, sz);
-}
-
-extern "C" __attribute__((noinline)) void
-agg_from_smem_to_gmem_binId_count(int64_t* dest, int64_t* src, const int32_t sz) {
-  return agg_from_smem_to_gmem_nop(dest, src, sz);
 }
 
 extern "C" __attribute__((noinline)) void init_group_by_buffer_gpu(
@@ -1381,4 +1363,31 @@ extern "C" void multifrag_query(const int8_t*** col_buffers,
                total_matched,
                error_code);
   }
+}
+
+extern "C" ALWAYS_INLINE DEVICE bool check_interrupt() {
+  if (check_interrupt_init(static_cast<unsigned>(INT_CHECK))) {
+    return true;
+  }
+  return false;
+}
+
+extern "C" bool check_interrupt_init(unsigned command) {
+  static std::atomic_bool runtime_interrupt_flag{false};
+
+  if (command == static_cast<unsigned>(INT_CHECK)) {
+    if (runtime_interrupt_flag.load()) {
+      return true;
+    }
+    return false;
+  }
+  if (command == static_cast<unsigned>(INT_ABORT)) {
+    runtime_interrupt_flag.store(true);
+    return false;
+  }
+  if (command == static_cast<unsigned>(INT_RESET)) {
+    runtime_interrupt_flag.store(false);
+    return false;
+  }
+  return false;
 }

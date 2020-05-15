@@ -28,32 +28,27 @@
 #include <string>
 #include <vector>
 
-#include "Shared/ConfigResolve.h"
+struct ExplainInfo {
+  bool explain;
+  bool explain_optimized;
+  bool explain_plan;
+  bool calcite_explain;
 
-enum class CalciteDMLPathSelection : int {
-  Unsupported = 0,
-  OnlyUpdates = 1,
-  OnlyDeletes = 2,
-  UpdatesAndDeletes = 3,
+  static ExplainInfo defaults() { return ExplainInfo{false, false, false, false}; }
+
+  bool justExplain() const { return explain || explain_plan || explain_optimized; }
+
+  bool justCalciteExplain() const { return calcite_explain; }
 };
-
-constexpr inline CalciteDMLPathSelection yield_dml_path_selector() {
-  int selector = 0;
-  if (std::is_same<CalciteDeletePathSelector, PreprocessorTrue>::value) {
-    selector |= 0x02;
-  }
-  if (std::is_same<CalciteUpdatePathSelector, PreprocessorTrue>::value) {
-    selector |= 0x01;
-  }
-  return static_cast<CalciteDMLPathSelection>(selector);
-}
 
 class ParserWrapper {
  public:
   // HACK:  This needs to go away as calcite takes over parsing
   enum class DMLType : int { Insert = 0, Delete, Update, Upsert, NotDML };
 
-  enum class ExplainType { None, IR, OptimizedIR, Calcite, Other };
+  enum class ExplainType { None, IR, OptimizedIR, Calcite, ExecutionPlan, Other };
+
+  enum class QueryType { Unknown, Read, Write, SchemaRead, SchemaWrite };
 
   ParserWrapper(std::string query_string);
   std::string process(std::string user,
@@ -64,6 +59,8 @@ class ParserWrapper {
   virtual ~ParserWrapper();
 
   bool is_ddl = false;
+  // is_update_dml does not imply UPDATE,
+  // but rather any of the statement types: INSERT DELETE UPDATE UPSERT
   bool is_update_dml = false;
   bool is_ctas = false;
   bool is_itas = false;
@@ -75,13 +72,20 @@ class ParserWrapper {
 
   DMLType getDMLType() const { return dml_type_; }
 
+  ExplainInfo getExplainInfo() const;
+
   ExplainType getExplainType() const { return explain_type_; }
+
+  QueryType getQueryType() const { return query_type_; }
 
   bool isCalciteExplain() const { return explain_type_ == ExplainType::Calcite; }
 
+  bool isPlanExplain() const { return explain_type_ == ExplainType::ExecutionPlan; }
+
   bool isSelectExplain() const {
     return explain_type_ == ExplainType::Calcite || explain_type_ == ExplainType::IR ||
-           explain_type_ == ExplainType::OptimizedIR;
+           explain_type_ == ExplainType::OptimizedIR ||
+           explain_type_ == ExplainType::ExecutionPlan;
   }
 
   bool isIRExplain() const {
@@ -98,22 +102,10 @@ class ParserWrapper {
 
   bool isCalcitePermissableDml(bool read_only_mode) {
     if (read_only_mode) {
-      return !is_update_dml;  // If we're read-only, no DML is permissable
+      return !is_update_dml;  // If we're read-only, no update/delete DML is permissable
     }
-
-    // TODO: A good place for if-constexpr
-    switch (yield_dml_path_selector()) {
-      case CalciteDMLPathSelection::OnlyUpdates:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Update);
-      case CalciteDMLPathSelection::OnlyDeletes:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete);
-      case CalciteDMLPathSelection::UpdatesAndDeletes:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete) ||
-               (getDMLType() == ParserWrapper::DMLType::Update);
-      case CalciteDMLPathSelection::Unsupported:
-      default:
-        return false;
-    }
+    return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete) ||
+           (getDMLType() == ParserWrapper::DMLType::Update);
   }
 
   bool isCalciteDdl() const { return is_calcite_ddl_; }
@@ -121,12 +113,14 @@ class ParserWrapper {
  private:
   DMLType dml_type_ = DMLType::NotDML;
   ExplainType explain_type_ = ExplainType::None;
+  QueryType query_type_ = QueryType::Unknown;
 
   static const std::vector<std::string> ddl_cmd;
   static const std::vector<std::string> update_dml_cmd;
   static const std::string explain_str;
   static const std::string calcite_explain_str;
   static const std::string optimized_explain_str;
+  static const std::string plan_explain_str;
   static const std::string optimize_str;
   static const std::string validate_str;
 

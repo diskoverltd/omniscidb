@@ -11,7 +11,7 @@
 #include "../QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
 #include "../QueryEngine/Execute.h"
 #include "../QueryRunner/QueryRunner.h"
-#include "Shared/MapDParameters.h"
+#include "DBHandlerTestHelpers.h"
 #include "Shared/scope.h"
 #include "TestHelpers.h"
 #include "ThriftHandler/QueryState.h"
@@ -25,11 +25,12 @@ using namespace TestHelpers;
 
 using QR = QueryRunner::QueryRunner;
 extern size_t g_leaf_count;
+extern bool g_enable_fsi;
 
 namespace {
+
 std::shared_ptr<Calcite> g_calcite;
 bool g_aggregator{false};
-size_t g_num_leafs{1};
 
 Catalog_Namespace::UserMetadata user;
 std::vector<DBObject> privObjects;
@@ -38,6 +39,11 @@ auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
 
 inline void run_ddl_statement(const std::string& query) {
   QR::get()->runDDLStatement(query);
+}
+
+inline auto sql(std::string_view sql_stmts) {
+  return QR::get()->runMultipleStatements(std::string(sql_stmts),
+                                          ExecutorDeviceType::CPU);
 }
 
 }  // namespace
@@ -238,6 +244,33 @@ class DashboardObject : public ::testing::Test {
   void TearDown() override { drop_dashboards(); }
 };
 
+struct ServerObject : public DBHandlerTestFixture {
+  Users user_;
+  Roles role_;
+
+ protected:
+  void SetUp() override {
+    if (g_aggregator) {
+      LOG(INFO) << "Test fixture not supported in distributed mode.";
+      return;
+    }
+    g_enable_fsi = true;
+    DBHandlerTestFixture::SetUp();
+    sql("CREATE SERVER test_server FOREIGN DATA WRAPPER omnisci_csv "
+        "WITH (storage_type = 'LOCAL_FILE', base_path = '/test_path/');");
+  }
+
+  void TearDown() override {
+    if (g_aggregator) {
+      LOG(INFO) << "Test fixture not supported in distributed mode.";
+      return;
+    }
+    sql("DROP SERVER IF EXISTS test_server;");
+    DBHandlerTestFixture::TearDown();
+    g_enable_fsi = false;
+  }
+};
+
 TEST_F(GrantSyntax, MultiPrivilegeGrantRevoke) {
   if (g_aggregator) {
     LOG(ERROR) << "Test not supported in distributed mode.";
@@ -306,6 +339,20 @@ TEST_F(GrantSyntax, MultiRoleGrantRevoke) {
   check_grant();
   ASSERT_NO_THROW(run_ddl_statement("REVOKE Gunners, Sudens FROM Juventus, Bayern"));
   check_revoke();
+}
+
+class InvalidGrantSyntax : public DBHandlerTestFixture {};
+
+TEST_F(InvalidGrantSyntax, InvalidGrantSyntax) {
+  std::string error_message;
+  if (g_aggregator) {
+    error_message = "Exception: Syntax error at: ON";
+  } else {
+    error_message = "Syntax error at: ON";
+  }
+
+  queryAndAssertException("GRANT SELECT, INSERT, ON TABLE tbl TO Arsenal, Juventus;",
+                          error_message);
 }
 
 TEST(UserRoles, InvalidGrantsRevokesTest) {
@@ -1375,6 +1422,141 @@ TEST_F(DashboardObject, GranteesListAfterRevokesTest) {
   ASSERT_EQ(recs5, 0);
 }
 
+TEST_F(ServerObject, AccessDefaultsTest) {
+  if (g_aggregator) {
+    LOG(INFO) << "Test not supported in distributed mode.";
+    return;
+  }
+  Catalog_Namespace::Catalog& cat = getCatalog();
+  AccessPrivileges server_priv;
+  ASSERT_NO_THROW(server_priv.add(AccessPrivileges::DROP_SERVER));
+  privObjects.clear();
+  DBObject server_object("test_server", DBObjectType::ServerDBObjectType);
+  server_object.loadKey(cat);
+  ASSERT_NO_THROW(server_object.setPrivileges(server_priv));
+  privObjects.push_back(server_object);
+
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), false);
+}
+
+TEST_F(ServerObject, AccessAfterGrantsRevokes) {
+  if (g_aggregator) {
+    LOG(INFO) << "Test not supported in distributed mode.";
+    return;
+  }
+  Catalog_Namespace::Catalog& cat = getCatalog();
+  ASSERT_NO_THROW(sys_cat.grantRole("Sudens", "Bayern"));
+  ASSERT_NO_THROW(sys_cat.grantRole("OldLady", "Juventus"));
+  AccessPrivileges server_priv;
+  ASSERT_NO_THROW(server_priv.add(AccessPrivileges::DROP_SERVER));
+  DBObject server_object("test_server", DBObjectType::ServerDBObjectType);
+  server_object.loadKey(cat);
+  ASSERT_NO_THROW(server_object.setPrivileges(server_priv));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Arsenal", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Sudens", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("OldLady", server_object, cat));
+  privObjects.clear();
+  privObjects.push_back(server_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), true);
+
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Arsenal", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Sudens", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("OldLady", server_object, cat));
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), false);
+}
+
+TEST_F(ServerObject, AccessWithGrantRevokeAllCompound) {
+  if (g_aggregator) {
+    LOG(INFO) << "Test not supported in distributed mode.";
+    return;
+  }
+  Catalog_Namespace::Catalog& cat = getCatalog();
+  ASSERT_NO_THROW(sys_cat.grantRole("Sudens", "Bayern"));
+  ASSERT_NO_THROW(sys_cat.grantRole("OldLady", "Juventus"));
+  AccessPrivileges server_priv;
+  ASSERT_NO_THROW(server_priv.add(AccessPrivileges::ALL_SERVER));
+  DBObject server_object("test_server", DBObjectType::ServerDBObjectType);
+  server_object.loadKey(cat);
+
+  // Effectively give all users ALL_SERVER privileges
+  ASSERT_NO_THROW(server_object.setPrivileges(server_priv));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Arsenal", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Sudens", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("OldLady", server_object, cat));
+
+  // All users should now have ALL_SERVER privileges, check this is true
+  privObjects.clear();
+  privObjects.push_back(server_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), true);
+
+  // Check that all users have a subset of ALL_SERVER privileges, in this case
+  // check that is true for CREATE_SERVER
+  server_priv.reset();
+  ASSERT_NO_THROW(server_priv.add(AccessPrivileges::CREATE_SERVER));
+  ASSERT_NO_THROW(server_object.setPrivileges(server_priv));
+  privObjects.clear();
+  privObjects.push_back(server_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), true);
+
+  // Revoke CREATE_SERVER from all users and check that they don't have it
+  // anymore (expect super-users)
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Arsenal", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Sudens", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("OldLady", server_object, cat));
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), false);
+
+  // All users should still have DROP_SERVER privileges, check that this is true
+  server_priv.reset();
+  ASSERT_NO_THROW(server_priv.add(AccessPrivileges::DROP_SERVER));
+  ASSERT_NO_THROW(server_object.setPrivileges(server_priv));
+  privObjects.clear();
+  privObjects.push_back(server_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), true);
+
+  // Revoke ALL_SERVER privileges
+  server_priv.reset();
+  ASSERT_NO_THROW(server_priv.add(AccessPrivileges::ALL_SERVER));
+  ASSERT_NO_THROW(server_object.setPrivileges(server_priv));
+  privObjects.clear();
+  privObjects.push_back(server_object);
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Arsenal", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Sudens", server_object, cat));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("OldLady", server_object, cat));
+
+  // Check that after the revoke of ALL_SERVER privileges users no longer
+  // have the DROP_SERVER privilege (except super-users)
+  server_priv.reset();
+  ASSERT_NO_THROW(server_priv.add(AccessPrivileges::DROP_SERVER));
+  ASSERT_NO_THROW(server_object.setPrivileges(server_priv));
+  privObjects.clear();
+  privObjects.push_back(server_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", privObjects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), false);
+}
+
 void create_tables(std::string prefix, int max) {
   const auto cat = QR::get()->getCatalog();
   for (int i = 0; i < max; i++) {
@@ -2314,27 +2496,68 @@ TEST(SysCatalog, SwitchDatabase) {
   static std::string dbname3{dbname + "3"};
 
   // cleanup
-  struct CleanupGuard {
-    ~CleanupGuard() {
-      run_ddl_statement("DROP DATABASE IF EXISTS " + dbname3 + ";");
-      run_ddl_statement("DROP DATABASE IF EXISTS " + dbname2 + ";");
-      run_ddl_statement("DROP DATABASE IF EXISTS " + dbname + ";");
-      run_ddl_statement("DROP USER " + username + ";");
-    }
-  } cleanupGuard;
+  try {
+    sql("DROP DATABASE IF EXISTS " + dbname + ";");
+  } catch (...) {
+  }
+  try {
+    sql("DROP DATABASE IF EXISTS " + dbname2 + ";");
+  } catch (...) {
+  }
+  try {
+    sql("DROP DATABASE IF EXISTS " + dbname3 + ";");
+  } catch (...) {
+  }
+  try {
+    sql("DROP USER " + username + ";");
+  } catch (...) {
+  }
 
   // setup
-  run_ddl_statement("CREATE USER " + username + " (password = 'password');");
-  run_ddl_statement("CREATE DATABASE " + dbname + "(owner='" + username + "');");
-  run_ddl_statement("CREATE DATABASE " + dbname2 + "(owner='" + username + "');");
-  run_ddl_statement("CREATE DATABASE " + dbname3 + "(owner='" + username + "');");
-  run_ddl_statement("REVOKE ACCESS ON DATABASE " + dbname3 + " FROM " + username + ";");
+  sql("CREATE USER " + username + " (password = 'password');");
+  sql("CREATE DATABASE " + dbname + "(owner='" + username + "');");
+  sql("CREATE DATABASE " + dbname2 + "(owner='" + username + "');");
+  sql("CREATE DATABASE " + dbname3 + "(owner='" + username + "');");
+  sql("REVOKE ACCESS ON DATABASE " + dbname3 + " FROM " + username + ";");
 
   // test some attempts to switch database
   ASSERT_NO_THROW(sys_cat.switchDatabase(dbname, username));
   ASSERT_NO_THROW(sys_cat.switchDatabase(dbname, username));
   ASSERT_NO_THROW(sys_cat.switchDatabase(dbname2, username));
   ASSERT_THROW(sys_cat.switchDatabase(dbname3, username), std::runtime_error);
+
+  // // distributed test
+  // // NOTE(sy): disabling for now due to consistency errors
+  // if (DQR* dqr = dynamic_cast<DQR*>(QR::get()); g_aggregator && dqr) {
+  //   static const std::string tname{"swdb_test_table"};
+  //   LeafAggregator* agg = dqr->getLeafAggregator();
+  //   agg->switch_database(dqr->getSession()->get_session_id(), dbname);
+  //   sql("CREATE TABLE " + tname + "(i INTEGER);");
+  //   ASSERT_NO_THROW(sql("SELECT i FROM " + tname + ";"));
+  //   agg->switch_database(dqr->getSession()->get_session_id(), dbname2);
+  //   ASSERT_ANY_THROW(agg->leafCatalogConsistencyCheck(*dqr->getSession()));
+  //   agg->switch_database(dqr->getSession()->get_session_id(), dbname);
+  //   ASSERT_NO_THROW(sql("DROP TABLE " + tname + ";"));
+  //   agg->switch_database(dqr->getSession()->get_session_id(), OMNISCI_DEFAULT_DB);
+  // }
+
+  // cleanup
+  try {
+    sql("DROP DATABASE IF EXISTS " + dbname + ";");
+  } catch (...) {
+  }
+  try {
+    sql("DROP DATABASE IF EXISTS " + dbname2 + ";");
+  } catch (...) {
+  }
+  try {
+    sql("DROP DATABASE IF EXISTS " + dbname3 + ";");
+  } catch (...) {
+  }
+  try {
+    sql("DROP USER " + username + ";");
+  } catch (...) {
+  }
 }
 
 namespace {
@@ -2343,7 +2566,7 @@ void compare_user_lists(const std::vector<std::string>& expected,
                         const std::list<Catalog_Namespace::UserMetadata>& actual) {
   ASSERT_EQ(expected.size(), actual.size());
   size_t i = 0;
-  for (const auto user : actual) {
+  for (const auto& user : actual) {
     ASSERT_EQ(expected[i++], user.userName);
   }
 }
@@ -2372,6 +2595,14 @@ TEST(SysCatalog, AllUserMetaTest) {
     const std::vector<std::string> user_champions = {"Juventus", "Bayern"};
     const std::vector<std::string> user_europa = {"Arsenal", "Juventus"};
   } expected;
+
+  // cleanup
+  struct CleanupGuard {
+    ~CleanupGuard() {
+      run_ddl_statement("DROP DATABASE IF EXISTS " + champions + ";");
+      run_ddl_statement("DROP DATABASE IF EXISTS " + europa + ";");
+    }
+  } cleanupGuard;
 
   run_ddl_statement("DROP DATABASE IF EXISTS " + champions + ";");
   run_ddl_statement("DROP DATABASE IF EXISTS " + europa + ";");
@@ -2449,6 +2680,8 @@ TEST(SysCatalog, RecursiveRolesUserMetaData) {
       run_ddl_statement("DROP ROLE " + north_london + ";");
       run_ddl_statement("DROP ROLE " + munich + ";");
       run_ddl_statement("DROP ROLE " + turin + ";");
+      run_ddl_statement("DROP DATABASE IF EXISTS " + champions + ";");
+      run_ddl_statement("DROP DATABASE IF EXISTS " + europa + ";");
     }
   } cleanupGuard;
 
@@ -2537,7 +2770,58 @@ TEST(Login, Deactivation) {
   run_ddl_statement("DROP USER deactivated_user;");
 }
 
+class GetDbObjectsForGranteeTest : public DBHandlerTestFixture {
+ protected:
+  void SetUp() override {
+    DBHandlerTestFixture::SetUp();
+    sql("CREATE USER test_user (password = 'test_pass');");
+  }
+
+  void TearDown() override {
+    sql("DROP USER test_user;");
+    DBHandlerTestFixture::TearDown();
+  }
+};
+
+TEST_F(GetDbObjectsForGranteeTest, UserWithGrantAllOnDatabase) {
+  g_enable_fsi = false;
+  sql("GRANT ALL ON DATABASE omnisci TO test_user;");
+
+  const auto& [db_handler, session_id] = getDbHandlerAndSessionId();
+  std::vector<TDBObject> db_objects{};
+  db_handler->get_db_objects_for_grantee(db_objects, session_id, "test_user");
+
+  std::unordered_set<TDBObjectType::type> privilege_types{};
+  for (const auto& db_object : db_objects) {
+    ASSERT_EQ("omnisci", db_object.objectName);
+    ASSERT_EQ(TDBObjectType::DatabaseDBObjectType, db_object.objectType);
+    ASSERT_EQ("test_user", db_object.grantee);
+
+    if (db_object.privilegeObjectType == TDBObjectType::DatabaseDBObjectType) {
+      // The first two items represent CREATE and DROP DATABASE privileges, which are not
+      // granted
+      std::vector<bool> expected_privileges{false, false, true, true};
+      ASSERT_EQ(expected_privileges, db_object.privs);
+    } else {
+      ASSERT_TRUE(std::all_of(db_object.privs.begin(),
+                              db_object.privs.end(),
+                              [](bool has_privilege) { return has_privilege; }));
+    }
+    privilege_types.emplace(db_object.privilegeObjectType);
+  }
+
+  ASSERT_FALSE(privilege_types.find(TDBObjectType::DatabaseDBObjectType) ==
+               privilege_types.end());
+  ASSERT_FALSE(privilege_types.find(TDBObjectType::TableDBObjectType) ==
+               privilege_types.end());
+  ASSERT_FALSE(privilege_types.find(TDBObjectType::DashboardDBObjectType) ==
+               privilege_types.end());
+  ASSERT_FALSE(privilege_types.find(TDBObjectType::ViewDBObjectType) ==
+               privilege_types.end());
+}
+
 int main(int argc, char* argv[]) {
+  g_enable_fsi = true;
   testing::InitGoogleTest(&argc, argv);
 
   namespace po = boost::program_options;
@@ -2579,5 +2863,6 @@ int main(int argc, char* argv[]) {
     LOG(ERROR) << e.what();
   }
   QR::reset();
+  g_enable_fsi = false;
   return err;
 }

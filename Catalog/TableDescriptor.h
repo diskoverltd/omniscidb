@@ -19,9 +19,19 @@
 
 #include <cstdint>
 #include <string>
-#include "../DataMgr/MemoryLevel.h"
-#include "../Fragmenter/AbstractFragmenter.h"
-#include "../Shared/sqldefs.h"
+
+#include "DataMgr/MemoryLevel.h"
+#include "Fragmenter/AbstractFragmenter.h"
+#include "Shared/sqldefs.h"
+
+/**
+ * @type StorageType
+ * @brief Encapsulates an enumeration of table storage type strings
+ */
+struct StorageType {
+  static constexpr char const* FOREIGN_TABLE = "FOREIGN_TABLE";
+  static constexpr char const* LOCAL_TABLE = "LOCAL_TABLE";
+};
 
 /**
  * @type TableDescriptor
@@ -48,7 +58,7 @@ struct TableDescriptor {
   std::string
       keyMetainfo;  // meta-information about shard keys and shared dictionary, as JSON
 
-  Fragmenter_Namespace::AbstractFragmenter*
+  std::shared_ptr<Fragmenter_Namespace::AbstractFragmenter>
       fragmenter;  // point to fragmenter object for the table.  it's instantiated upon
                    // first use.
   int32_t
@@ -75,6 +85,8 @@ struct TableDescriptor {
       , persistenceLevel(Data_Namespace::MemoryLevel::DISK_LEVEL)
       , hasDeletedCol(true)
       , mutex_(std::make_shared<std::mutex>()) {}
+
+  virtual ~TableDescriptor() = default;
 };
 
 inline bool table_is_replicated(const TableDescriptor* td) {
@@ -86,7 +98,7 @@ inline bool compare_td_id(const TableDescriptor* first, const TableDescriptor* s
   return (first->tableId < second->tableId);
 }
 
-inline bool table_is_temporary(const TableDescriptor* td) {
+inline bool table_is_temporary(const TableDescriptor* const td) {
   return td->persistenceLevel == Data_Namespace::MemoryLevel::CPU_LEVEL;
 }
 

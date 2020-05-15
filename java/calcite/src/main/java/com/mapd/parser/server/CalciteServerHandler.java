@@ -21,16 +21,16 @@ import com.mapd.calcite.parser.MapDParser;
 import com.mapd.calcite.parser.MapDParserOptions;
 import com.mapd.calcite.parser.MapDUser;
 import com.mapd.common.SockTransportProperties;
-import com.mapd.thrift.calciteserver.CalciteServer;
-import com.mapd.thrift.calciteserver.InvalidParseRequest;
-import com.mapd.thrift.calciteserver.TAccessedQueryObjects;
-import com.mapd.thrift.calciteserver.TCompletionHint;
-import com.mapd.thrift.calciteserver.TCompletionHintType;
-import com.mapd.thrift.calciteserver.TExtArgumentType;
-import com.mapd.thrift.calciteserver.TFilterPushDownInfo;
-import com.mapd.thrift.calciteserver.TPlanResult;
-import com.mapd.thrift.calciteserver.TUserDefinedFunction;
-import com.mapd.thrift.calciteserver.TUserDefinedTableFunction;
+import com.omnisci.thrift.calciteserver.CalciteServer;
+import com.omnisci.thrift.calciteserver.InvalidParseRequest;
+import com.omnisci.thrift.calciteserver.TAccessedQueryObjects;
+import com.omnisci.thrift.calciteserver.TCompletionHint;
+import com.omnisci.thrift.calciteserver.TCompletionHintType;
+import com.omnisci.thrift.calciteserver.TExtArgumentType;
+import com.omnisci.thrift.calciteserver.TFilterPushDownInfo;
+import com.omnisci.thrift.calciteserver.TPlanResult;
+import com.omnisci.thrift.calciteserver.TUserDefinedFunction;
+import com.omnisci.thrift.calciteserver.TUserDefinedTableFunction;
 
 import org.apache.calcite.prepare.MapDPlanner;
 import org.apache.calcite.prepare.SqlIdentifierCapturer;
@@ -418,6 +418,8 @@ public class CalciteServerHandler implements CalciteServer.Iface {
         return ExtensionFunction.ExtArgumentType.PFloat;
       case PDouble:
         return ExtensionFunction.ExtArgumentType.PDouble;
+      case PBool:
+        return ExtensionFunction.ExtArgumentType.PBool;
       case Bool:
         return ExtensionFunction.ExtArgumentType.Bool;
       case ArrayInt8:
@@ -432,10 +434,18 @@ public class CalciteServerHandler implements CalciteServer.Iface {
         return ExtensionFunction.ExtArgumentType.ArrayFloat;
       case ArrayDouble:
         return ExtensionFunction.ExtArgumentType.ArrayDouble;
+      case ArrayBool:
+        return ExtensionFunction.ExtArgumentType.ArrayBool;
       case GeoPoint:
         return ExtensionFunction.ExtArgumentType.GeoPoint;
+      case GeoLineString:
+        return ExtensionFunction.ExtArgumentType.GeoLineString;
       case Cursor:
         return ExtensionFunction.ExtArgumentType.Cursor;
+      case GeoPolygon:
+        return ExtensionFunction.ExtArgumentType.GeoPolygon;
+      case GeoMultiPolygon:
+        return ExtensionFunction.ExtArgumentType.GeoMultiPolygon;
       default:
         MAPDLOGGER.error("toExtArgumentType: unknown type " + type);
         return null;

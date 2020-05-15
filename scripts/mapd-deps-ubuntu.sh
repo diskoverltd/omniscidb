@@ -3,6 +3,25 @@
 set -e
 set -x
 
+# Parse inputs
+TSAN=false
+COMPRESS=false
+
+while (( $# )); do
+  case "$1" in
+    --compress)
+      COMPRESS=true
+      ;;
+    --tsan)
+      TSAN=true
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 
 SUFFIX=${SUFFIX:=$(date +%Y%m%d)}
@@ -10,7 +29,19 @@ PREFIX=/usr/local/mapd-deps
 
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source $SCRIPTS_DIR/common-functions.sh
+
+# Establish distro
 source /etc/os-release
+if [ "$ID" == "ubuntu" ] ; then
+  PACKAGER="apt -y"
+  if [ "$VERSION_ID" != "19.10" ] && [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ] && [ "$VERSION_ID" != "16.04" ]; then
+    echo "Ubuntu 19.10, 19.04, 18.04, and 16.04 are the only debian-based releases supported by this script"
+    exit 1
+  fi
+else
+  echo "Only Ubuntu is supported by this script"
+  exit 1
+fi
 
 sudo mkdir -p $PREFIX
 sudo chown -R $(id -u) $PREFIX
@@ -20,8 +51,6 @@ sudo apt install -y \
     software-properties-common \
     build-essential \
     ccache \
-    cmake \
-    cmake-curses-gui \
     git \
     wget \
     curl \
@@ -60,7 +89,7 @@ sudo apt install -y \
     autoconf-archive \
     automake \
     bison \
-    flex-old \
+    flex \
     libpng-dev \
     rsync \
     unzip \
@@ -76,17 +105,22 @@ sudo apt install -y \
 export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:$PKG_CONFIG_PATH
 export PATH=$PREFIX/bin:$PATH
 
+install_ninja
+
+install_cmake
+
 # llvm
 # (see common-functions.sh)
 install_llvm
 
 # Geo Support
 install_gdal
+install_geos
 
 # install AWS core and s3 sdk
 install_awscpp -j $(nproc)
 
-VERS=0.11.0
+VERS=0.13.0
 wget --continue http://apache.claz.org/thrift/$VERS/thrift-$VERS.tar.gz
 tar xvf thrift-$VERS.tar.gz
 pushd thrift-$VERS
@@ -97,6 +131,7 @@ CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-ruby=no \
     --with-qt4=no \
     --with-qt5=no \
+    --with-java=no \
     --prefix=$PREFIX
 make -j $(nproc)
 make install
@@ -133,6 +168,9 @@ make install
 popd
 
 download_make_install ${HTTP_DEPS}/bisonpp-1.21-45.tar.gz bison++-1.21
+
+# TBB
+install_tbb
 
 # Apache Arrow (see common-functions.sh)
 ARROW_BOOST_USE_SHARED="ON"
@@ -247,6 +285,11 @@ echo
 echo "Done. Be sure to source the 'mapd-deps.sh' file to pick up the required environment variables:"
 echo "    source $PREFIX/mapd-deps.sh"
 
-if [ "$1" = "--compress" ] ; then
-    tar acf mapd-deps-ubuntu-$VERSION_ID-$SUFFIX.tar.xz -C $PREFIX .
+if [ "$COMPRESS" = "true" ] ; then
+    if [ "$TSAN" = "false" ]; then
+      TARBALL_TSAN=""
+    elif [ "$TSAN" = "true" ]; then
+      TARBALL_TSAN="tsan-"
+    fi
+    tar acvf mapd-deps-ubuntu-${VERSION_ID}-${TARBALL_TSAN}${SUFFIX}.tar.xz -C ${PREFIX} .
 fi

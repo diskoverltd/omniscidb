@@ -49,9 +49,15 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
       throw HashJoinFail("Equijoin types must be identical, found: " +
                          lhs_ti.get_type_name() + ", " + rhs_ti.get_type_name());
     }
-    if (!lhs_ti.is_integer() && !lhs_ti.is_time() && !lhs_ti.is_string()) {
+    if (!lhs_ti.is_integer() && !lhs_ti.is_time() && !lhs_ti.is_string() &&
+        !lhs_ti.is_decimal()) {
       throw HashJoinFail("Cannot apply hash join to inner column type " +
                          lhs_ti.get_type_name());
+    }
+    // Decimal types should be identical.
+    if (lhs_ti.is_decimal() && (lhs_ti.get_scale() != rhs_ti.get_scale() ||
+                                lhs_ti.get_precision() != rhs_ti.get_precision())) {
+      throw HashJoinFail("Equijoin with different decimal types");
     }
   }
 
@@ -60,6 +66,10 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
   if (lhs_ti.is_string() && (static_cast<bool>(lhs_cast) != static_cast<bool>(rhs_cast) ||
                              (lhs_cast && lhs_cast->get_optype() != kCAST) ||
                              (rhs_cast && rhs_cast->get_optype() != kCAST))) {
+    throw HashJoinFail("Cannot use hash join for given expression");
+  }
+  // Casts to decimal are not suported.
+  if (lhs_ti.is_decimal() && (lhs_cast || rhs_cast)) {
     throw HashJoinFail("Cannot use hash join for given expression");
   }
   const auto lhs_col =
@@ -113,21 +123,31 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
       !(dynamic_cast<const Analyzer::FunctionOper*>(lhs)) && outer_col
           ? outer_col->get_type_info()
           : outer_ti;
+  // Casts from decimal are not supported.
+  if ((inner_col_real_ti.is_decimal() || outer_col_ti.is_decimal()) &&
+      (lhs_cast || rhs_cast)) {
+    throw HashJoinFail("Cannot use hash join for given expression");
+  }
   if (is_overlaps_join) {
     if (!inner_col_real_ti.is_array()) {
       throw HashJoinFail(
           "Overlaps join only supported for inner columns with array type");
     }
-    if (!(inner_col_real_ti.is_fixlen_array() && inner_col_real_ti.get_size() == 32)) {
+    auto is_bounds_array = [](const auto ti) {
+      return ti.is_fixlen_array() && ti.get_size() == 32;
+    };
+    if (!is_bounds_array(inner_col_real_ti)) {
       throw HashJoinFail(
           "Overlaps join only supported for 4-element double fixed length arrays");
     }
-    if (!(outer_col_ti.get_type() == kPOINT)) {
+    if (!(outer_col_ti.get_type() == kPOINT || is_bounds_array(outer_col_ti))) {
       throw HashJoinFail(
-          "Overlaps join only supported for geometry outer columns of type point");
+          "Overlaps join only supported for geometry outer columns of type point or "
+          "geometry columns with bounds");
     }
   } else {
     if (!(inner_col_real_ti.is_integer() || inner_col_real_ti.is_time() ||
+          inner_col_real_ti.is_decimal() ||
           (inner_col_real_ti.is_string() &&
            inner_col_real_ti.get_compression() == kENCODING_DICT))) {
       throw HashJoinFail(
@@ -135,7 +155,20 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
           "strings");
     }
   }
-  return {inner_col, outer_col ? outer_col : outer_expr};
+
+  auto normalized_inner_col = inner_col;
+  auto normalized_outer_col = outer_col ? outer_col : outer_expr;
+
+  const auto& normalized_inner_ti = normalized_inner_col->get_type_info();
+  const auto& normalized_outer_ti = normalized_outer_col->get_type_info();
+
+  if (normalized_inner_ti.is_string() != normalized_outer_ti.is_string()) {
+    throw HashJoinFail(std::string("Could not build hash tables for incompatible types " +
+                                   normalized_inner_ti.get_type_name() + " and " +
+                                   normalized_outer_ti.get_type_name()));
+  }
+
+  return {normalized_inner_col, normalized_outer_col};
 }
 
 std::vector<InnerOuter> normalize_column_pairs(const Analyzer::BinOper* condition,
@@ -311,10 +344,7 @@ std::shared_ptr<JoinHashTable> JoinHashTable::getInstance(
     Executor* executor) {
   decltype(std::chrono::steady_clock::now()) ts1, ts2;
   if (VLOGGING(1)) {
-    VLOG(1) << "Building perfect hash table "
-            << (preferred_hash_type == JoinHashTableInterface::HashType::OneToOne
-                    ? "OneToOne"
-                    : "OneToMany")
+    VLOG(1) << "Building perfect hash table " << getHashTypeString(preferred_hash_type)
             << " for qual: " << qual_bin_oper->toString();
     ts1 = std::chrono::steady_clock::now();
   }
@@ -406,50 +436,11 @@ std::shared_ptr<JoinHashTable> JoinHashTable::getInstance(
   if (VLOGGING(1)) {
     ts2 = std::chrono::steady_clock::now();
     VLOG(1) << "Built perfect hash table "
-            << (join_hash_table->getHashType() ==
-                        JoinHashTableInterface::HashType::OneToOne
-                    ? "OneToOne"
-                    : "OneToMany")
-            << " in "
+            << getHashTypeString(join_hash_table->getHashType()) << " in "
             << std::chrono::duration_cast<std::chrono::milliseconds>(ts2 - ts1).count()
             << " ms";
   }
   return join_hash_table;
-}
-
-std::pair<const int8_t*, size_t> JoinHashTable::getOneColumnFragment(
-    const Analyzer::ColumnVar& hash_col,
-    const Fragmenter_Namespace::FragmentInfo& fragment,
-    const Data_Namespace::MemoryLevel effective_mem_lvl,
-    const int device_id,
-    std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner) {
-  return ColumnFetcher::getOneColumnFragment(executor_,
-                                             hash_col,
-                                             fragment,
-                                             effective_mem_lvl,
-                                             device_id,
-                                             chunks_owner,
-                                             column_cache_);
-}
-
-std::pair<const int8_t*, size_t> JoinHashTable::getAllColumnFragments(
-    const Analyzer::ColumnVar& hash_col,
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-    std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner) {
-  std::lock_guard<std::mutex> linearized_multifrag_column_lock(
-      linearized_multifrag_column_mutex_);
-  if (linearized_multifrag_column_.first) {
-    return linearized_multifrag_column_;
-  }
-  const int8_t* col_buff;
-  size_t total_elem_count;
-  std::tie(col_buff, total_elem_count) = ColumnFetcher::getAllColumnFragments(
-      executor_, hash_col, fragments, chunks_owner, column_cache_);
-  linearized_multifrag_column_owner_.addColBuffer(col_buff);
-  if (!shardCount()) {
-    linearized_multifrag_column_ = {col_buff, total_elem_count};
-  }
-  return {col_buff, total_elem_count};
 }
 
 bool needs_dictionary_translation(const Analyzer::ColumnVar* inner_col,
@@ -484,11 +475,11 @@ bool needs_dictionary_translation(const Analyzer::ColumnVar* inner_col,
   return outer_ti.get_comp_param() != inner_ti.get_comp_param();
 }
 
-std::deque<Fragmenter_Namespace::FragmentInfo> only_shards_for_device(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+std::vector<Fragmenter_Namespace::FragmentInfo> only_shards_for_device(
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     const int device_count) {
-  std::deque<Fragmenter_Namespace::FragmentInfo> shards_for_device;
+  std::vector<Fragmenter_Namespace::FragmentInfo> shards_for_device;
   for (const auto& fragment : fragments) {
     CHECK_GE(fragment.shard, 0);
     if (fragment.shard % device_count == device_id) {
@@ -569,51 +560,8 @@ void JoinHashTable::reify() {
   }
 }
 
-std::pair<const int8_t*, size_t> JoinHashTable::fetchFragments(
-    const Analyzer::ColumnVar* hash_col,
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragment_info,
-    const Data_Namespace::MemoryLevel effective_memory_level,
-    const int device_id,
-    std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner,
-    ThrustAllocator& dev_buff_owner) {
-  static std::mutex fragment_fetch_mutex;
-  const bool has_multi_frag = fragment_info.size() > 1;
-  const auto& catalog = *executor_->getCatalog();
-  auto& data_mgr = catalog.getDataMgr();
-  const auto& first_frag = fragment_info.front();
-  const int8_t* col_buff = nullptr;
-  size_t elem_count = 0;
-
-  const size_t elem_width = hash_col->get_type_info().get_size();
-  if (has_multi_frag) {
-    std::tie(col_buff, elem_count) =
-        getAllColumnFragments(*hash_col, fragment_info, chunks_owner);
-  }
-
-  {
-    std::lock_guard<std::mutex> fragment_fetch_lock(fragment_fetch_mutex);
-    if (has_multi_frag) {
-      if (effective_memory_level == Data_Namespace::GPU_LEVEL && col_buff) {
-        CHECK_NE(elem_count, size_t(0));
-        int8_t* dev_col_buff = nullptr;
-        dev_col_buff = dev_buff_owner.allocate(elem_count * elem_width);
-        copy_to_gpu(&data_mgr,
-                    reinterpret_cast<CUdeviceptr>(dev_col_buff),
-                    col_buff,
-                    elem_count * elem_width,
-                    device_id);
-        col_buff = dev_col_buff;
-      }
-    } else {
-      std::tie(col_buff, elem_count) = getOneColumnFragment(
-          *hash_col, first_frag, effective_memory_level, device_id, chunks_owner);
-    }
-  }
-  return {col_buff, elem_count};
-}
-
 ChunkKey JoinHashTable::genHashTableKey(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const Analyzer::Expr* outer_col_expr,
     const Analyzer::ColumnVar* inner_col) const {
   ChunkKey hash_table_key{executor_->getCatalog()->getCurrentDB().dbId,
@@ -638,7 +586,7 @@ ChunkKey JoinHashTable::genHashTableKey(
 }
 
 void JoinHashTable::reifyOneToOneForDevice(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     const logger::ThreadId parent_thread_id) {
   DEBUG_TIMER_NEW_THREAD(parent_thread_id);
@@ -663,32 +611,37 @@ void JoinHashTable::reifyOneToOneForDevice(
     // No data in this fragment. Still need to create a hash table and initialize it
     // properly.
     ChunkKey empty_chunk;
-    initHashTableForDevice(
-        empty_chunk, nullptr, 0, cols, effective_memory_level, device_id);
+    initOneToOneHashTable(empty_chunk,
+                          JoinColumn{nullptr, 0, 0, 0, 0},
+                          cols,
+                          effective_memory_level,
+                          device_id);
+    return;
   }
 
   std::vector<std::shared_ptr<Chunk_NS::Chunk>> chunks_owner;
   ThrustAllocator dev_buff_owner(&data_mgr, device_id);
-  const int8_t* col_buff = nullptr;
-  size_t elem_count = 0;
+  std::vector<std::shared_ptr<void>> malloc_owner;
 
-  std::tie(col_buff, elem_count) = fetchFragments(inner_col,
-                                                  fragments,
-                                                  effective_memory_level,
-                                                  device_id,
-                                                  chunks_owner,
-                                                  dev_buff_owner);
+  JoinColumn join_column = fetchJoinColumn(inner_col,
+                                           fragments,
+                                           effective_memory_level,
+                                           device_id,
+                                           chunks_owner,
+                                           dev_buff_owner,
+                                           malloc_owner,
+                                           executor_,
+                                           &column_cache_);
 
-  initHashTableForDevice(genHashTableKey(fragments, cols.second, inner_col),
-                         col_buff,
-                         elem_count,
-                         cols,
-                         effective_memory_level,
-                         device_id);
+  initOneToOneHashTable(genHashTableKey(fragments, cols.second, inner_col),
+                        join_column,
+                        cols,
+                        effective_memory_level,
+                        device_id);
 }
 
 void JoinHashTable::reifyOneToManyForDevice(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     const logger::ThreadId parent_thread_id) {
   DEBUG_TIMER_NEW_THREAD(parent_thread_id);
@@ -711,26 +664,30 @@ void JoinHashTable::reifyOneToManyForDevice(
           : memory_level_;
   if (fragments.empty()) {
     ChunkKey empty_chunk;
-    initOneToManyHashTable(
-        empty_chunk, nullptr, 0, cols, effective_memory_level, device_id);
+    initOneToManyHashTable(empty_chunk,
+                           JoinColumn{nullptr, 0, 0, 0, 0},
+                           cols,
+                           effective_memory_level,
+                           device_id);
     return;
   }
 
   std::vector<std::shared_ptr<Chunk_NS::Chunk>> chunks_owner;
   ThrustAllocator dev_buff_owner(&data_mgr, device_id);
-  const int8_t* col_buff = nullptr;
-  size_t elem_count = 0;
+  std::vector<std::shared_ptr<void>> malloc_owner;
 
-  std::tie(col_buff, elem_count) = fetchFragments(inner_col,
-                                                  fragments,
-                                                  effective_memory_level,
-                                                  device_id,
-                                                  chunks_owner,
-                                                  dev_buff_owner);
+  JoinColumn join_column = fetchJoinColumn(inner_col,
+                                           fragments,
+                                           effective_memory_level,
+                                           device_id,
+                                           chunks_owner,
+                                           dev_buff_owner,
+                                           malloc_owner,
+                                           executor_,
+                                           &column_cache_);
 
   initOneToManyHashTable(genHashTableKey(fragments, cols.second, inner_col),
-                         col_buff,
-                         elem_count,
+                         join_column,
                          cols,
                          effective_memory_level,
                          device_id);
@@ -751,9 +708,8 @@ void JoinHashTable::checkHashJoinReplicationConstraint(const int table_id) const
   }
 }
 
-void JoinHashTable::initHashTableOnCpu(
-    const int8_t* col_buff,
-    const size_t num_elements,
+void JoinHashTable::initOneToOneHashTableOnCpu(
+    const JoinColumn& join_column,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols,
     const HashEntryInfo hash_entry_info,
     const int32_t hash_join_invalid_val) {
@@ -797,8 +753,7 @@ void JoinHashTable::initHashTableOnCpu(
     for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
       init_cpu_buff_threads.emplace_back([this,
                                           hash_join_invalid_val,
-                                          col_buff,
-                                          num_elements,
+                                          &join_column,
                                           sd_inner_proxy,
                                           sd_outer_proxy,
                                           thread_idx,
@@ -809,7 +764,7 @@ void JoinHashTable::initHashTableOnCpu(
         int partial_err =
             fill_hash_join_buff_bucketized(&(*cpu_hash_table_buff_)[0],
                                            hash_join_invalid_val,
-                                           {col_buff, num_elements},
+                                           join_column,
                                            {static_cast<size_t>(ti.get_size()),
                                             col_range_.getIntMin(),
                                             col_range_.getIntMax(),
@@ -842,8 +797,7 @@ void JoinHashTable::initHashTableOnCpu(
 }
 
 void JoinHashTable::initOneToManyHashTableOnCpu(
-    const int8_t* col_buff,
-    const size_t num_elements,
+    const JoinColumn& join_column,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols,
     const HashEntryInfo hash_entry_info,
     const int32_t hash_join_invalid_val) {
@@ -855,7 +809,7 @@ void JoinHashTable::initOneToManyHashTableOnCpu(
     return;
   }
   cpu_hash_table_buff_ = std::make_shared<std::vector<int32_t>>(
-      2 * hash_entry_info.getNormalizedHashEntryCount() + num_elements);
+      2 * hash_entry_info.getNormalizedHashEntryCount() + join_column.num_elems);
   const StringDictionaryProxy* sd_inner_proxy{nullptr};
   const StringDictionaryProxy* sd_outer_proxy{nullptr};
   if (ti.is_string()) {
@@ -891,7 +845,7 @@ void JoinHashTable::initOneToManyHashTableOnCpu(
     fill_one_to_many_hash_table_bucketized(&(*cpu_hash_table_buff_)[0],
                                            hash_entry_info,
                                            hash_join_invalid_val,
-                                           {col_buff, num_elements},
+                                           join_column,
                                            {static_cast<size_t>(ti.get_size()),
                                             col_range_.getIntMin(),
                                             col_range_.getIntMax(),
@@ -906,7 +860,7 @@ void JoinHashTable::initOneToManyHashTableOnCpu(
     fill_one_to_many_hash_table(&(*cpu_hash_table_buff_)[0],
                                 hash_entry_info,
                                 hash_join_invalid_val,
-                                {col_buff, num_elements},
+                                join_column,
                                 {static_cast<size_t>(ti.get_size()),
                                  col_range_.getIntMin(),
                                  col_range_.getIntMax(),
@@ -932,10 +886,9 @@ size_t get_entries_per_shard(const size_t total_entry_count, const size_t shard_
 
 }  // namespace
 
-void JoinHashTable::initHashTableForDevice(
+void JoinHashTable::initOneToOneHashTable(
     const ChunkKey& chunk_key,
-    const int8_t* col_buff,
-    const size_t num_elements,
+    const JoinColumn& join_column,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols,
     const Data_Namespace::MemoryLevel effective_memory_level,
     const int device_id) {
@@ -982,14 +935,14 @@ void JoinHashTable::initHashTableForDevice(
   const int32_t hash_join_invalid_val{-1};
   if (effective_memory_level == Data_Namespace::CPU_LEVEL) {
     CHECK(!chunk_key.empty());
-    initHashTableOnCpuFromCache(chunk_key, num_elements, cols);
+    initHashTableOnCpuFromCache(chunk_key, join_column.num_elems, cols);
     {
       std::lock_guard<std::mutex> cpu_hash_table_buff_lock(cpu_hash_table_buff_mutex_);
-      initHashTableOnCpu(
-          col_buff, num_elements, cols, hash_entry_info, hash_join_invalid_val);
+      initOneToOneHashTableOnCpu(
+          join_column, cols, hash_entry_info, hash_join_invalid_val);
     }
     if (inner_col->get_table_id() > 0) {
-      putHashTableOnCpuToCache(chunk_key, num_elements, cols);
+      putHashTableOnCpuToCache(chunk_key, join_column.num_elems, cols);
     }
     // Transfer the hash table on the GPU if we've only built it on CPU
     // but the query runs on GPU (join on dictionary encoded columns).
@@ -1028,7 +981,6 @@ void JoinHashTable::initHashTableForDevice(
     if (chunk_key.empty()) {
       return;
     }
-    JoinColumn join_column{col_buff, num_elements};
     JoinColumnTypeInfo type_info{static_cast<size_t>(ti.get_size()),
                                  col_range_.getIntMin(),
                                  col_range_.getIntMax(),
@@ -1075,8 +1027,7 @@ void JoinHashTable::initHashTableForDevice(
 
 void JoinHashTable::initOneToManyHashTable(
     const ChunkKey& chunk_key,
-    const int8_t* col_buff,
-    const size_t num_elements,
+    const JoinColumn& join_column,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols,
     const Data_Namespace::MemoryLevel effective_memory_level,
     const int device_id) {
@@ -1111,21 +1062,21 @@ void JoinHashTable::initOneToManyHashTable(
   auto& data_mgr = executor_->getCatalog()->getDataMgr();
   if (memory_level_ == Data_Namespace::GPU_LEVEL) {
     const size_t total_count =
-        2 * hash_entry_info.getNormalizedHashEntryCount() + num_elements;
+        2 * hash_entry_info.getNormalizedHashEntryCount() + join_column.num_elems;
     gpu_hash_table_buff_[device_id] = CudaAllocator::allocGpuAbstractBuffer(
         &data_mgr, total_count * sizeof(int32_t), device_id);
   }
 #endif
   const int32_t hash_join_invalid_val{-1};
   if (effective_memory_level == Data_Namespace::CPU_LEVEL) {
-    initHashTableOnCpuFromCache(chunk_key, num_elements, cols);
+    initHashTableOnCpuFromCache(chunk_key, join_column.num_elems, cols);
     {
       std::lock_guard<std::mutex> cpu_hash_table_buff_lock(cpu_hash_table_buff_mutex_);
       initOneToManyHashTableOnCpu(
-          col_buff, num_elements, cols, hash_entry_info, hash_join_invalid_val);
+          join_column, cols, hash_entry_info, hash_join_invalid_val);
     }
     if (inner_col->get_table_id() > 0) {
-      putHashTableOnCpuToCache(chunk_key, num_elements, cols);
+      putHashTableOnCpuToCache(chunk_key, join_column.num_elems, cols);
     }
     // Transfer the hash table on the GPU if we've only built it on CPU
     // but the query runs on GPU (join on dictionary encoded columns).
@@ -1154,7 +1105,6 @@ void JoinHashTable::initOneToManyHashTable(
         hash_join_invalid_val,
         executor_->blockSize(),
         executor_->gridSize());
-    JoinColumn join_column{col_buff, num_elements};
     JoinColumnTypeInfo type_info{static_cast<size_t>(ti.get_size()),
                                  col_range_.getIntMin(),
                                  col_range_.getIntMax(),
@@ -1210,6 +1160,11 @@ void JoinHashTable::initHashTableOnCpuFromCache(
     const size_t num_elements,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols) {
   auto timer = DEBUG_TIMER(__func__);
+  CHECK_GE(chunk_key.size(), size_t(2));
+  if (chunk_key[1] < 0) {
+    // Do not cache hash tables over intermediate results
+    return;
+  }
   const auto outer_col = dynamic_cast<const Analyzer::ColumnVar*>(cols.second);
   JoinHashTableCacheKey cache_key{col_range_,
                                   *cols.first,
@@ -1231,6 +1186,11 @@ void JoinHashTable::putHashTableOnCpuToCache(
     const ChunkKey& chunk_key,
     const size_t num_elements,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols) {
+  CHECK_GE(chunk_key.size(), size_t(2));
+  if (chunk_key[1] < 0) {
+    // Do not cache hash tables over intermediate results
+    return;
+  }
   const auto outer_col = dynamic_cast<const Analyzer::ColumnVar*>(cols.second);
   JoinHashTableCacheKey cache_key{col_range_,
                                   *cols.first,
@@ -1489,8 +1449,17 @@ std::string JoinHashTable::toString(const ExecutorDeviceType device_type,
   auto ptr2 = ptr1 + offsetBufferOff();
   auto ptr3 = ptr1 + countBufferOff();
   auto ptr4 = ptr1 + payloadBufferOff();
-  return JoinHashTableInterface::toString(
-      "perfect", 0, 0, hash_entry_count_, ptr1, ptr2, ptr3, ptr4, buffer_size, raw);
+  return JoinHashTableInterface::toString("perfect",
+                                          getHashTypeString(hash_type_),
+                                          0,
+                                          0,
+                                          hash_entry_count_,
+                                          ptr1,
+                                          ptr2,
+                                          ptr3,
+                                          ptr4,
+                                          buffer_size,
+                                          raw);
 }
 
 std::set<DecodedJoinHashBufferEntry> JoinHashTable::toSet(
